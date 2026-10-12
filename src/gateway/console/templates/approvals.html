@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}Approvals{% endblock %}
+{% block content %}
+<h1>Approvals</h1>
+<meta name="csrf-token" content="{{ csrf_token }}">
+
+<h2>Pending queue</h2>
+{% if queue %}
+<table>
+  <tr><th>Request</th><th>Agent</th><th>Tool</th><th>Requested</th><th>Expires</th><th>Cap</th><th></th></tr>
+  {% for q in queue %}
+  <tr>
+    <td><code>{{ q.id }}</code>{% if q.destructive %} <span class="badge denied">destructive</span>{% endif %}</td>
+    <td>{{ q.agent_id }}</td>
+    <td><code>{{ q.tool }}</code></td>
+    <td>{{ q.created_at }}</td>
+    <td>{{ q.expires_at }}</td>
+    <td>{{ q.cap_used }} of {{ q.cap_total }}</td>
+    <td><button class="warn" onclick="loadCard('{{ q.id }}')">Review</button></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="note">No pending approval requests.</p>
+{% endif %}
+
+<h2>Approval card</h2>
+<div id="card" class="card"><p class="note">Select a request from the queue to review it.</p></div>
+<div id="decision" style="display:none" class="card">
+  <h3>Decision</h3>
+  <label>Note (optional)<br><input id="note" style="width:100%" placeholder="reason for the decision"></label><br><br>
+  <label><input type="checkbox" id="execute_on_approval"> Execute on approval (server-side; for agents that cannot poll)</label><br><br>
+  <button class="ok" onclick="decide('approve')">Approve (one-time)</button>
+  <button class="danger" onclick="decide('deny')">Deny</button>
+  <span id="decision_result" class="note"></span>
+</div>
+
+<h2>Decision history</h2>
+{% if history %}
+<table>
+  <tr><th>Request</th><th>Agent</th><th>Tool</th><th>Status</th><th>Decided</th><th>By</th></tr>
+  {% for h in history %}
+  <tr>
+    <td><code>{{ h.id }}</code></td>
+    <td>{{ h.agent_id }}</td>
+    <td><code>{{ h.tool }}</code></td>
+    <td><span class="badge {{ h.status }}">{{ h.status }}</span></td>
+    <td>{{ h.decided_at }}</td>
+    <td>{{ h.decided_by }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="note">No decisions yet.</p>
+{% endif %}
+
+<h2>Counterparty records</h2>
+<p class="note">Per-payee records from audited calls (FR-PAA05-001). Corrections are diffed and audit-logged.</p>
+{% if counterparties %}
+<table>
+  <tr><th>Key</th><th>Calls</th><th>Last seen</th><th>Notes</th><th>Details</th><th></th></tr>
+  {% for c in counterparties %}
+  <tr>
+    <td><code>{{ c.key }}</code></td>
+    <td>{{ c.call_count }}</td>
+    <td>{{ c.last_seen_at }}</td>
+    <td>{{ c.notes }}</td>
+    <td><pre class="args">{{ c.details_snapshot }}</pre></td>
+    <td><button onclick="correctCounterparty('{{ c.key }}')">Correct</button></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="note">No counterparty records yet.</p>
+{% endif %}
+
+<h2>Unknown-outcome blocks</h2>
+<p class="note">Retries blocked after a timeout/ambiguous call (FR-PAA06-003). Resolve after a status check.</p>
+{% if blocks %}
+<table>
+  <tr><th>ID</th><th>Agent</th><th>Tool</th><th>Created</th><th>Detail</th><th></th></tr>
+  {% for b in blocks %}
+  <tr>
+    <td>{{ b.id }}</td>
+    <td>{{ b.agent_id }}</td>
+    <td><code>{{ b.tool }}</code></td>
+    <td>{{ b.created_at }}</td>
+    <td>{{ b.detail }}</td>
+    <td><button onclick="resolveBlock({{ b.id }})">Resolve</button></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="note">No unresolved blocks.</p>
+{% endif %}
+
+<script>
+let currentApr = null;
+let confirmationToken = null;
+function csrf() {
+  return document.querySelector('meta[name="csrf-token"]').content;
+}
+async function loadCard(aprId) {
+  const r = await fetch('/api/approvals/' + aprId);
+  const data = await r.json();
+  currentApr = aprId;
+  confirmationToken = data.confirmation_token || null;
+  document.getElementById('card').innerHTML = data.card_html +
+    '<p class="note">Status: ' + data.status +
+    (data.destructive ? ' &nbsp;|&nbsp; <strong>destructive scope</strong> — per-decision confirmation token required.' : '') +
+    '</p>';
+  document.getElementById('decision').style.display = data.status === 'pending' ? 'block' : 'none';
+  document.getElementById('decision_result').textContent = '';
+}
+async function decide(decision) {
+  const body = {
+    decision: decision,
+    scope: 'one_time',
+    note: document.getElementById('note').value,
+    execute_on_approval: document.getElementById('execute_on_approval').checked,
+  };
+  if (confirmationToken) body.confirmation_token = confirmationToken;
+  const r = await fetch('/api/approvals/' + currentApr + '/decision', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf()},
+    body: JSON.stringify(body),
+  });
+  const data = await r.json();
+  document.getElementById('decision_result').textContent =
+    r.ok ? ('Recorded: ' + data.status + (data.executed ? ' (executed server-side)' : '')) : ('Error: ' + (data.error || r.status));
+  if (r.ok) setTimeout(() => location.reload(), 1200);
+}
+async function correctCounterparty(key) {
+  const notes = prompt('Correction notes for ' + key + ':');
+  if (notes === null) return;
+  const detailsRaw = prompt('New details snapshot (JSON object):', '{}');
+  let details = {};
+  try { details = JSON.parse(detailsRaw || '{}'); } catch (e) { alert('Invalid JSON'); return; }
+  const r = await fetch('/api/counterparties/' + encodeURIComponent(key) + '/correct', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf()},
+    body: JSON.stringify({notes: notes, details: details}),
+  });
+  const data = await r.json();
+  alert(r.ok ? 'Corrected (audit-logged).' : ('Error: ' + (data.error || r.status)));
+  if (r.ok) location.reload();
+}
+async function resolveBlock(id) {
+  const note = prompt('Resolution note (e.g. status check confirmed non-execution):') || '';
+  const r = await fetch('/api/unknown-outcome/' + id + '/resolve', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf()},
+    body: JSON.stringify({note: note}),
+  });
+  const data = await r.json();
+  alert(r.ok ? 'Resolved.' : ('Error: ' + (data.error || r.status)));
+  if (r.ok) location.reload();
+}
+</script>
+{% endblock %}

@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Policies{% endblock %}
+{% block content %}
+<h1>Policies</h1>
+<p class="note">Every save creates an immutable version (current: <strong>v{{ current_version or "none" }}</strong>). Nothing is edited in place. Rollback creates a <em>new</em> version copying the old content.</p>
+
+<h2>Rules (top-down, first match wins)</h2>
+<table>
+  <tr><th>#</th><th>Name</th><th>Agent</th><th>Tool</th><th>Effect</th><th>Conditions</th><th>Description</th></tr>
+  {% for r in rules %}
+  <tr{% if r.pinned %} style="background:#f3f4f6"{% endif %}>
+    <td>{{ loop.index }}</td>
+    <td>{{ r.name }}{% if r.pinned %} <span class="note">(pinned — cannot be removed)</span>{% endif %}</td>
+    <td>{{ r.agent_id or "all" }}</td>
+    <td>{{ r.tool or "all" }}</td>
+    <td><span class="badge {{ r.effect }}">{{ r.effect }}</span></td>
+    <td><code>{{ (r.conditions or {}) | tojson }}</code></td>
+    <td>{{ r.description or "" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Add rule (no-DSL builder)</h2>
+<form method="post" action="/policies/add-rule">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="filters">
+    <label>Name <input name="name" required size="30"></label>
+    <label>Agent (blank = all) <input name="agent_id" size="20"></label>
+    <label>Tool (blank = all) <input name="tool" size="20" placeholder="email.send"></label>
+    <label>Effect
+      <select name="effect">
+        <option value="allow">Allow</option>
+        <option value="deny">Deny</option>
+        <option value="require_approval">Require approval</option>
+      </select>
+    </label>
+  </div>
+  <label>Conditions (JSON, optional) <textarea name="conditions" rows="4" placeholder='{"time_window": {"days": ["mon","tue"], "start": "09:00", "end": "18:00"}}'></textarea></label>
+  <p><label>Change note <input name="change_note" size="60"></label>
+  <button type="submit" class="ok">Save as new version</button></p>
+</form>
+
+<h2>Raw JSON editor</h2>
+<p class="note">Escape hatch: edit the full rule set as JSON. Same stored rules as the builder.</p>
+<form method="post" action="/policies/save">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <textarea name="raw_rules" rows="18" spellcheck="false">{{ raw_rules }}</textarea>
+  <p>
+    <label>Change note <input name="change_note" size="50"></label>
+    <label>Classification
+      <select name="material">
+        <option value="auto">auto</option>
+        <option value="true">material</option>
+        <option value="false">non-material</option>
+      </select>
+    </label>
+    <button type="submit" class="ok">Save as new version</button>
+  </p>
+</form>
+
+<h2>Version history</h2>
+<table>
+  <tr><th>Version</th><th>Created</th><th>By</th><th>Material</th><th>Note</th><th>Actions</th></tr>
+  {% for v in versions %}
+  <tr>
+    <td>v{{ v.version }}{% if v.is_current %} <strong>(current)</strong>{% endif %}</td>
+    <td>{{ v.created_at | localtime }}</td>
+    <td>{{ v.created_by }}</td>
+    <td>{{ "material" if v.material_change else "non-material" }}</td>
+    <td>{{ v.change_note or "" }}</td>
+    <td>
+      {% if not v.is_current %}
+      <form class="inline" method="post" action="/policies/rollback">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="version" value="{{ v.version }}">
+        <button type="submit" class="warn" onclick="return confirm('Roll back to v{{ v.version }}? This creates a NEW version.');">Rollback</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Diff versions</h2>
+<form method="get" action="/policies">
+  <label>From <input name="diff_a" size="4" value="{{ diff.a if diff else '' }}"></label>
+  <label>To <input name="diff_b" size="4" value="{{ diff.b if diff else '' }}"></label>
+  <button type="submit">Diff</button>
+</form>
+{% if diff %}
+  {% if diff.error %}<div class="error">{{ diff.error }}</div>
+  {% else %}
+  <h3>Added in v{{ diff.b }} vs v{{ diff.a }}</h3>
+  <table><tr><th>Name</th><th>Agent</th><th>Tool</th><th>Effect</th></tr>
+  {% for r in diff.added %}<tr><td>{{ r.name }}</td><td>{{ r.agent_id or "all" }}</td><td>{{ r.tool or "all" }}</td><td>{{ r.effect }}</td></tr>{% endfor %}</table>
+  <h3>Removed in v{{ diff.b }} vs v{{ diff.a }}</h3>
+  <table><tr><th>Name</th><th>Agent</th><th>Tool</th><th>Effect</th></tr>
+  {% for r in diff.removed %}<tr><td>{{ r.name }}</td><td>{{ r.agent_id or "all" }}</td><td>{{ r.tool or "all" }}</td><td>{{ r.effect }}</td></tr>{% endfor %}</table>
+  {% endif %}
+{% endif %}
+
+<h2>Dry-run preview (AC-12)</h2>
+<p class="note">Replays a policy version against the last N days of audit history (or the labeled synthetic corpus when empty). Nothing is enforced.</p>
+<form method="get" action="/policies" id="dryrun-form">
+  <label>Version <input name="dry_version" id="dry-version" size="4" value="{{ current_version or '' }}"></label>
+  <label>Window (days) <input name="dry_days" id="dry-days" size="4" value="7"></label>
+  <button type="button" class="ok" onclick="runDryRun()">Preview</button>
+</form>
+<pre class="args" id="dryrun-out">Dry-run output appears here.</pre>
+<script>
+async function runDryRun() {
+  const token = "{{ csrf_token }}";
+  const res = await fetch("/api/policy/dry-run", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-CSRF-Token": token},
+    body: JSON.stringify({
+      policy_version: parseInt(document.getElementById("dry-version").value, 10),
+      window_days: parseInt(document.getElementById("dry-days").value, 10) || 7
+    })
+  });
+  document.getElementById("dryrun-out").textContent = JSON.stringify(await res.json(), null, 2);
+}
+</script>
+{% endblock %}

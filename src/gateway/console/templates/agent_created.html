@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Agent registered{% endblock %}
+{% block content %}
+<h1>Agent registered</h1>
+<div class="secret">
+  <strong>Copy the secret now — it is shown ONCE and never again (FR-022).</strong>
+  <p>Agent ID: <code>{{ agent_id }}</code><br>
+  Client ID: <code>{{ client_id }}</code><br>
+  Client secret: <code>{{ client_secret }}</code><br>
+  Default mandate: <code>{{ mandate_id }}</code> (read-only)</p>
+</div>
+<p><a href="/agents/{{ agent_id }}">View agent detail →</a></p>
+{% endblock %}

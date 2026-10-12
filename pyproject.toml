@@ -1,0 +1,53 @@
+# Personal Agent Security Gateway — M1 foundation
+#
+# SDK FLOOR (FR-005 / AC-10, GHSA-qx49-fqc8-xw99):
+# The gateway MUST build on MCP Python SDK >= the fixed releases
+# (1.30.0 / 2.2.0 lineage). The pre-fix versions carry the OAuth
+# account-takeover flaw (malicious server could exfiltrate client
+# secrets, auth codes, and PKCE verifiers; advisory published
+# 2026-09-28, no CVE assigned as of 2026-09-29). Dependency drift
+# below this floor reintroduces the flaw, so the floor is enforced
+# both here (pip) and in CI (AC-10).
+
+[project]
+name = "agent-security-gateway"
+version = "0.1.0"
+description = "Personal Agent Security Gateway — MCP control plane (M1 foundation)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=4.0.0",        # MCP server framework (M0 spike verified 4.1.0)
+    "mcp>=2.2.0",            # SDK FLOOR: GHSA-qx49-fqc8-xw99 fixed in 1.30.0/2.2.0 lineage
+    "fastapi>=0.110.0",      # admin console + health endpoints (M6 console; M1 health only)
+    "uvicorn>=0.29.0",       # ASGI server for Streamable HTTP
+    "sqlalchemy>=2.0.0",     # ORM: config + audit SQLite, Postgres-migration seam
+    "pydantic>=2.0.0",       # settings/validation
+    "jsonschema>=4.21.0",    # input-schema validation (M3 minimal validator; M5 hardened)
+    "cryptography>=42.0.0",  # envelope encryption (M4 vault), HMAC-SHA256 helpers
+    "pyotp>=2.9.0",          # admin TOTP (M6)
+    "qrcode[pil]>=7.4",       # TOTP QR provisioning at admin setup (M6)
+    "bcrypt>=4.1.0",         # secret hashing (agent credentials, admin password)
+    "httpx>=0.27.0",         # connector HTTP + tests
+    "jinja2>=3.1.0",         # admin console templates (M2: Agents, Audit Log)
+    "pyyaml>=6.0",            # raw YAML policy editor (M6, Policies page)
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gateway"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

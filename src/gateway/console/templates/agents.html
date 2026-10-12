@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Agents{% endblock %}
+{% block content %}
+<h1>Agents</h1>
+<p class="note">Register, inspect, pause, revoke agent identities. One credential per agent (Fix A). M2: no admin auth yet — M6 adds it.</p>
+
+<div class="card">
+<h2>Register agent</h2>
+<form method="post" action="/agents">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="filters">
+    <label>Agent ID <input name="agent_id" required placeholder="ag_muse_01"></label>
+    <label>Platform
+      <select name="platform">
+        <option value="muse">muse</option>
+        <option value="grok">grok</option>
+        <option value="dots">dots</option>
+      </select>
+    </label>
+    <label>Display name <input name="display_name" required placeholder="Muse main"></label>
+    <label>Household role <input name="household_role" required placeholder="ken"></label>
+    <button class="ok" type="submit">Register</button>
+  </div>
+</form>
+</div>
+
+<h2>Registered agents</h2>
+<table>
+  <tr><th>ID</th><th>Platform</th><th>Name</th><th>Household role</th><th>Status</th><th>Auth</th><th>Last seen</th></tr>
+  {% for a in agents %}
+  <tr>
+    <td><a href="/agents/{{ a.id }}"><code>{{ a.id }}</code></a></td>
+    <td>{{ a.platform }}</td>
+    <td>{{ a.display_name }}</td>
+    <td>{{ a.household_role }}</td>
+    <td><span class="badge {{ a.status }}">{{ a.status }}</span></td>
+    <td>{{ a.auth_method }}</td>
+    <td>{{ a.last_seen_at or "—" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Mandates{% endblock %}
+{% block content %}
+<h1>Mandates</h1>
+<p class="note">Standing instructions per agent. Pause, narrow, end, and withdraw are one action each (FR-PAA01-006). Pausing, ending, or withdrawing a mandate cancels its pending approvals and invalidates its grants immediately (FR-PAA01-004).</p>
+
+{% for a in agents %}
+<div class="card">
+  <h3>{{ a.display_name }} <code>{{ a.agent_id }}</code></h3>
+  {% if a.mandates %}
+  <table>
+    <tr><th>ID</th><th>Purpose</th><th>Purpose key</th><th>Allowed classes</th><th>Status</th><th>Expires</th><th>Actions</th></tr>
+    {% for m in a.mandates %}
+    <tr>
+      <td><code>{{ m.id }}</code></td>
+      <td>{{ m.purpose }}</td>
+      <td>{{ m.purpose_key or "—" }}</td>
+      <td>{{ m.allowed_classes | join(", ") }}</td>
+      <td><span class="badge {{ m.status }}">{{ m.status }}</span></td>
+      <td>{{ m.expires_at | localtime }}</td>
+      <td>
+        {% if m.status == "active" %}
+        <form class="inline" method="post" action="/mandates/{{ m.id }}/action">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="pause">
+          <button type="submit" class="warn">Pause</button>
+        </form>
+        <form class="inline" method="post" action="/mandates/{{ m.id }}/action">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="end">
+          <button type="submit" class="danger" onclick="return confirm('End mandate {{ m.id }}? Pending approvals are canceled.');">End</button>
+        </form>
+        <form class="inline" method="post" action="/mandates/{{ m.id }}/action">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="narrow">
+          <input name="allowed_classes" size="18" placeholder="read,communicate">
+          <button type="submit">Narrow</button>
+        </form>
+        {% elif m.status == "paused" %}
+        <form class="inline" method="post" action="/mandates/{{ m.id }}/action">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="resume">
+          <button type="submit" class="ok">Resume</button>
+        </form>
+        {% endif %}
+        {% if m.status in ("active", "paused") %}
+        <form class="inline" method="post" action="/mandates/{{ m.id }}/action">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="withdraw">
+          <button type="submit" class="danger" onclick="return confirm('Withdraw mandate {{ m.id }}? This takes effect immediately.');">Withdraw</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="note">No mandates.</p>{% endif %}
+</div>
+{% endfor %}
+{% endblock %}

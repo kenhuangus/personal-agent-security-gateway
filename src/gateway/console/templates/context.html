@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Context boundaries{% endblock %}
+{% block content %}
+<h1>Context boundaries</h1>
+<p class="note">Purpose registry, data-label classes, and cross-context leakage events (FR-PAA03-001…004).</p>
+
+<h2>Purpose registry</h2>
+<p class="note">Declared purposes come from mandates (purpose_key) and the ontology <code>purpose</code> dimension. Policy rules bind to these; a call outside the allowed purpose is denied even when the tool is otherwise allowed (FR-PAA03-002).</p>
+<table>
+  <tr><th>Source</th><th>Values</th></tr>
+  <tr><td>Mandate purpose keys</td><td>{% for p in mandate_purposes %}<code>{{ p }}</code> {% endfor %}{% if not mandate_purposes %}<span class="note">none declared</span>{% endif %}</td></tr>
+  <tr><td>Ontology purpose dimension</td><td>{% for p in purpose_values %}<code>{{ p }}</code> {% endfor %}{% if not purpose_values %}<span class="note">dimension not registered</span>{% endif %}</td></tr>
+</table>
+
+<h2>Data-label classes</h2>
+<p class="note">Adapters tag returned data with a label class (or "unlabeled" when upstream metadata is unavailable — never guessed). Private/family facts inside a work-purpose response are flagged and redacted (FR-PAA03-003).</p>
+<table>
+  <tr><th>Label class</th><th>Ontology resources</th></tr>
+  {% for lc in label_classes %}
+  <tr><td><code>{{ lc }}</code></td><td>{{ label_counts.get(lc, 0) }}</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Cross-context leakage events</h2>
+{% if leakage_rows %}
+<table>
+  <tr><th>Time</th><th>Agent</th><th>Reason</th><th>Request</th></tr>
+  {% for e in leakage_rows %}
+  <tr><td>{{ e.timestamp | localtime }}</td><td>{{ e.agent_id }}</td><td>{{ e.reason }}</td><td><code>{{ e.request_id }}</code></td></tr>
+  {% endfor %}
+</table>
+{% else %}<p class="note">No leakage events recorded.</p>{% endif %}
+{% endblock %}

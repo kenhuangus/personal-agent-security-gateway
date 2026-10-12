@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Audit Log{% endblock %}
+{% block content %}
+<h1>Audit Log</h1>
+<p class="note">Append-only (FR-032). Redacted arguments only — the viewer never holds raw values.</p>
+
+<form method="get" action="/audit">
+  <div class="filters">
+    <label>Agent <input name="agent_id" value="{{ agent_id }}"></label>
+    <label>Tool <input name="tool" value="{{ tool }}"></label>
+    <label>Decision
+      <select name="decision">
+        <option value="">any</option>
+        {% for d in ["allowed","denied","approval_required","approved","denied_decision","expired","allowed_via_approval","error"] %}
+        <option value="{{ d }}" {% if decision == d %}selected{% endif %}>{{ d }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit">Filter</button>
+    <a href="/audit/export?format=json&agent_id={{ agent_id }}&tool={{ tool }}&decision={{ decision }}"><button type="button">Export JSON</button></a>
+    <a href="/audit/export?format=csv&agent_id={{ agent_id }}&tool={{ tool }}&decision={{ decision }}"><button type="button">Export CSV</button></a>
+  </div>
+</form>
+
+<table>
+  <tr><th>Time</th><th>Agent</th><th>Tool</th><th>Decision</th><th>Reason</th><th>Scope rule</th><th>Request</th></tr>
+  {% for e in entries %}
+  <tr>
+    <td>{{ e.timestamp }}</td>
+    <td><code>{{ e.agent_id }}</code></td>
+    <td><code>{{ e.tool }}</code></td>
+    <td><span class="badge {{ e.decision }}">{{ e.decision }}</span></td>
+    <td>{{ e.reason or "—" }}</td>
+    <td>{{ e.scope_rule or "—" }}</td>
+    <td><code>{{ e.request_id }}</code></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

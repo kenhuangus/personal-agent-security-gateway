@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+<p class="note">Security posture at a glance. <a href="/approvals">Approvals queue</a> is the time-critical action.</p>
+
+{% if stop_ack %}
+<div class="ack">
+  <h3>Global stop acknowledged</h3>
+  <p><strong>Received:</strong> {{ stop_ack.received_at | localtime }} — <strong>enforced:</strong> {{ stop_ack.enforced_at | localtime }}</p>
+  <p>{{ stop_ack.agents_paused }} agent(s) paused, {{ stop_ack.approvals_canceled }} pending approval(s) canceled.</p>
+  <table>
+    <tr><th>Item</th><th>ID</th><th>Before</th><th>After</th><th>Status</th></tr>
+    {% for i in stop_ack["items"] %}
+    <tr><td>{{ i.kind }}</td><td><code>{{ i.id }}</code></td><td>{{ i.before }}</td><td>{{ i.after }}</td><td>{{ i.note }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<div class="cards">
+  <div class="stat"><div class="num">{{ active_agents }}</div><div class="lbl">agents active</div></div>
+  <div class="stat"><div class="num">{{ calls_today }}</div><div class="lbl">tool calls today</div></div>
+  <div class="stat"><div class="num">{{ denied_today }}</div><div class="lbl">denied today</div></div>
+  <div class="stat"><div class="num">{{ pending_count }}</div><div class="lbl">pending approvals</div></div>
+</div>
+
+<div class="card">
+  <h2>Global stop</h2>
+  <p class="note">One action: pause every agent and cancel every pending approval (FR-PAA10-001). Per-item status is reported above; acknowledgment distinguishes received from enforced (FR-PAA10-003/004).</p>
+  <form method="post" action="/admin/stop-all" onsubmit="return confirm('Pause ALL agents and cancel ALL pending approvals?');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="danger">STOP EVERYTHING</button>
+  </form>
+</div>
+
+<h2>Agents</h2>
+<table>
+  <tr><th>Agent</th><th>Platform</th><th>Status</th><th>Last seen</th></tr>
+  {% for a in agent_rows %}
+  <tr>
+    <td><a href="/agents/{{ a.id }}">{{ a.display_name }}</a> <code>{{ a.id }}</code></td>
+    <td>{{ a.platform }}</td>
+    <td><span class="badge {{ a.status }}">{{ a.status }}</span></td>
+    <td>{{ a.last_seen_at | localtime }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Pending approvals</h2>
+{% if pending_rows %}
+<table>
+  <tr><th>ID</th><th>Agent</th><th>Tool</th><th>Created</th><th>Expires</th></tr>
+  {% for p in pending_rows %}
+  <tr><td><a href="/approvals"><code>{{ p.id }}</code></a></td><td>{{ p.agent_id }}</td><td>{{ p.tool }}</td><td>{{ p.created_at | localtime }}</td><td>{{ p.expires_at | localtime }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}<p class="note">No pending approvals.</p>{% endif %}
+
+<h2>Audit tail</h2>
+<table>
+  <tr><th>Time</th><th>Agent</th><th>Tool</th><th>Decision</th><th>Reason</th></tr>
+  {% for e in tail %}
+  <tr><td>{{ e.timestamp | localtime }}</td><td>{{ e.agent_id }}</td><td>{{ e.tool }}</td>
+  <td><span class="badge {{ e.decision }}">{{ e.decision }}</span></td><td>{{ e.reason or "" }}</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

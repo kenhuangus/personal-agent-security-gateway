@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Agent {{ agent.id }}{% endblock %}
+{% block content %}
+<h1>Agent <code>{{ agent.id }}</code></h1>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Display name</td><td>{{ agent.display_name }}</td></tr>
+  <tr><td>Platform</td><td>{{ agent.platform }}</td></tr>
+  <tr><td>Household role</td><td>{{ agent.household_role }}</td></tr>
+  <tr><td>Status</td><td><span class="badge {{ agent.status }}">{{ agent.status }}</span></td></tr>
+  <tr><td>Auth method</td><td>{{ agent.auth_method }}{% if agent.verified_test_date %} (fallback test date: {{ agent.verified_test_date }}){% endif %}</td></tr>
+  <tr><td>Created</td><td>{{ agent.created_at or "—" }}</td></tr>
+  <tr><td>Last seen</td><td>{{ agent.last_seen_at or "—" }}</td></tr>
+</table>
+
+<div class="card">
+<h2>Lifecycle</h2>
+<form class="inline" method="post" action="/agents/{{ agent.id }}/status">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="action" value="pause"><button class="warn" type="submit">Pause</button>
+</form>
+<form class="inline" method="post" action="/agents/{{ agent.id }}/status">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="action" value="resume"><button class="ok" type="submit">Resume</button>
+</form>
+<form class="inline" method="post" action="/agents/{{ agent.id }}/status" onsubmit="return confirm('Revoke this agent immediately?');">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="action" value="revoke"><button class="danger" type="submit">Revoke access</button>
+</form>
+<p class="note">Pause is temporary and resumable; revoke kills the identity immediately (FR-015, FR-PAA10-002).</p>
+</div>
+
+<h2>Live mandates</h2>
+<table>
+  <tr><th>ID</th><th>Purpose</th><th>Purpose key</th><th>Status</th><th>Expires</th></tr>
+  {% for m in mandates %}
+  <tr>
+    <td><code>{{ m.id }}</code></td>
+    <td>{{ m.purpose }}</td>
+    <td>{{ m.purpose_key or "—" }}</td>
+    <td>{{ m.status }}</td>
+    <td>{{ m.expires_at or "—" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Recent calls</h2>
+<table>
+  <tr><th>Time</th><th>Tool</th><th>Decision</th><th>Reason</th><th>Request</th></tr>
+  {% for c in calls %}
+  <tr>
+    <td>{{ c.timestamp }}</td>
+    <td><code>{{ c.tool }}</code></td>
+    <td><span class="badge {{ c.decision }}">{{ c.decision }}</span></td>
+    <td>{{ c.reason or "—" }}</td>
+    <td><code>{{ c.request_id }}</code></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

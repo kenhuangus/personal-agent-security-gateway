@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Ontology{% endblock %}
+{% block content %}
+<h1>Ontology review</h1>
+<p class="note">The feedback loop <em>flags</em> stale or conflicting entries here — it never auto-mutates authority. Discovery candidates are <em>not</em> authority until confirmed.</p>
+
+<h2>Review queue</h2>
+{% if review_items %}
+<table>
+  <tr><th>ID</th><th>Entry</th><th>Reason</th><th>Status</th><th>Detected</th><th>Actions</th></tr>
+  {% for i in review_items %}
+  <tr>
+    <td><code>{{ i.id }}</code></td>
+    <td><code>{{ i.entry_kind }}:{{ i.entry_id }}</code><br><span class="note">{{ i.provenance }}</span></td>
+    <td>{{ i.reason }}</td>
+    <td><span class="badge {{ i.status }}">{{ i.status }}</span></td>
+    <td>{{ i.detected_at | localtime }}</td>
+    <td>
+      {% if i.status == "open" %}
+      <form class="inline" method="post" action="/ontology/review/{{ i.id }}/resolve">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input name="note" size="20" placeholder="resolution note">
+        <button type="submit" class="ok">Resolve</button>
+      </form>
+      <form class="inline" method="post" action="/ontology/review/{{ i.id }}/dismiss">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Dismiss</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="note">Review queue is empty.</p>{% endif %}
+
+<h2>Discovery candidates</h2>
+<p class="note">Pending confirmation. Confirming promotes a candidate to authority with a full provenance chain.</p>
+{% if candidates %}
+<table>
+  <tr><th>ID</th><th>Kind</th><th>Payload</th><th>Provenance</th><th>Confidence</th><th>Actions</th></tr>
+  {% for c in candidates %}
+  <tr>
+    <td><code>{{ c.id }}</code></td>
+    <td>{{ c.kind }}</td>
+    <td><pre class="args">{{ c.payload | tojson(indent=2) }}</pre></td>
+    <td>{{ c.provenance }}</td>
+    <td>{{ c.confidence }}</td>
+    <td>
+      <form class="inline" method="post" action="/ontology/candidates/{{ c.id }}/confirm">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input name="corrections" size="24" placeholder='corrections JSON'>
+        <button type="submit" class="ok">Confirm</button>
+      </form>
+      <form class="inline" method="post" action="/ontology/candidates/{{ c.id }}/reject">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="danger">Reject</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="note">No pending candidates.</p>{% endif %}
+
+<h2>Principals</h2>
+<table>
+  <tr><th>ID</th><th>Kind</th><th>Display name</th></tr>
+  {% for p in principals %}
+  <tr><td><code>{{ p.id }}</code></td><td>{{ p.kind }}</td><td>{{ p.display_name }}</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Security Gateway — Admin Dashboard (Mock)</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --ink: #1a2230;
+    --muted: #687385;
+    --line: #e3e7ee;
+    --green: #1a7f37;
+    --green-bg: #e6f4ea;
+    --red: #b42318;
+    --red-bg: #fdecea;
+    --amber: #935705;
+    --amber-bg: #fdf1dc;
+    --blue: #175cd3;
+    --blue-bg: #e7effe;
+    --grey-bg: #eef1f5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .mock-banner {
+    background: #3b2f04;
+    color: #ffd75e;
+    text-align: center;
+    padding: 8px 12px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    font-weight: 700;
+  }
+  .app { display: flex; min-height: calc(100vh - 33px); }
+  .sidebar {
+    width: 210px;
+    background: var(--panel);
+    border-right: 1px solid var(--line);
+    padding: 18px 0;
+    flex-shrink: 0;
+  }
+  .brand { padding: 0 18px 14px; font-weight: 700; font-size: 15px; }
+  .brand small { display: block; font-weight: 400; color: var(--muted); font-size: 11px; }
+  .nav a {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 9px 18px;
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 13.5px;
+  }
+  .nav a.active { background: var(--grey-bg); font-weight: 600; border-left: 3px solid var(--blue); padding-left: 15px; }
+  .nav a:hover { background: var(--grey-bg); }
+  .count {
+    background: var(--amber-bg); color: var(--amber);
+    font-size: 11px; font-weight: 700;
+    border-radius: 999px; padding: 1px 8px;
+  }
+  .main { flex: 1; padding: 22px 26px 40px; max-width: 1180px; }
+  .topbar { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px; }
+  .topbar h1 { margin: 0; font-size: 20px; }
+  .topbar .meta { color: var(--muted); font-size: 12.5px; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .card .value { font-size: 24px; font-weight: 700; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; margin-bottom: 20px;
+  }
+  .panel-head {
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .panel-head h2 { margin: 0; font-size: 14.5px; }
+  .panel-head a { font-size: 12.5px; color: var(--blue); text-decoration: none; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  tr:last-child td { border-bottom: none; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  .badge {
+    display: inline-block; font-size: 11.5px; font-weight: 600;
+    border-radius: 4px; padding: 2px 8px; white-space: nowrap;
+  }
+  .b-green { background: var(--green-bg); color: var(--green); }
+  .b-red { background: var(--red-bg); color: var(--red); }
+  .b-amber { background: var(--amber-bg); color: var(--amber); }
+  .b-blue { background: var(--blue-bg); color: var(--blue); }
+  .b-grey { background: var(--grey-bg); color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot-green { background: #1a7f37; }
+  .dot-grey { background: #b6bec9; }
+  .approval {
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px 16px; margin: 12px 16px;
+  }
+  .approval h3 { margin: 0 0 6px; font-size: 14px; }
+  .approval .ctx { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; }
+  .approval .ctx .mono { color: var(--ink); }
+  .btn {
+    display: inline-block; border: 1px solid var(--line); background: var(--panel);
+    border-radius: 6px; padding: 7px 16px; font-size: 13px; font-weight: 600;
+    cursor: pointer; margin-right: 8px;
+  }
+  .btn-approve { background: var(--green); border-color: var(--green); color: #fff; }
+  .btn-deny { background: #fff; border-color: var(--red); color: var(--red); }
+  .redacted { background: var(--grey-bg); border-radius: 3px; padding: 0 4px; color: var(--muted); }
+  .policy-list { list-style: none; margin: 0; padding: 6px 0; }
+  .policy-list li {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 13px;
+  }
+  .policy-list li:last-child { border-bottom: none; }
+  .policy-list .pinned { color: var(--muted); font-style: italic; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 900px) {
+    .cards { grid-template-columns: repeat(2, 1fr); }
+    .two-col { grid-template-columns: 1fr; }
+    .sidebar { display: none; }
+  }
+  footer { color: var(--muted); font-size: 12px; padding: 0 2px; }
+</style>
+</head>
+<body>
+
+<div class="mock-banner">MOCK DATA — STATIC HTML MOCKUP, NOT CONNECTED TO A GATEWAY</div>
+
+<div class="app">
+  <nav class="sidebar">
+    <div class="brand">Agent Security Gateway<small>admin console</small></div>
+    <div class="nav">
+      <a href="#" class="active">Dashboard</a>
+      <a href="#">Agents</a>
+      <a href="#">Connectors</a>
+      <a href="#">Policies</a>
+      <a href="#">Approvals <span class="count">2</span></a>
+      <a href="#">Audit Log</a>
+      <a href="#">Vault &amp; Settings</a>
+      <a href="#">Mandates</a>
+      <a href="#">Context boundaries</a>
+    </div>
+  </nav>
+
+  <main class="main">
+    <div class="topbar">
+      <h1>Dashboard</h1>
+      <div class="meta">Gateway: <span class="badge b-green">healthy</span> &nbsp;·&nbsp; Mon Oct 12, 2026 15:15 EDT &nbsp; <button class="btn btn-deny" type="button" title="FR-PAA10-001: pause all agents and cancel pending approvals">Stop everything</button></div>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="label">Agents connected</div>
+        <div class="value">3</div>
+        <div class="sub">Muse · Grok Bot · Dots (provisional)</div>
+      </div>
+      <div class="card">
+        <div class="label">Tool calls today</div>
+        <div class="value">47</div>
+        <div class="sub">38 allowed · 4 via approval</div>
+      </div>
+      <div class="card">
+        <div class="label">Denied today</div>
+        <div class="value">5</div>
+        <div class="sub">3 policy-deny · 2 expired approvals</div>
+      </div>
+      <div class="card">
+        <div class="label">Pending approvals</div>
+        <div class="value">2</div>
+        <div class="sub">oldest waiting 6 min</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Connected agents</h2><a href="#">Manage agents →</a></div>
+      <table>
+        <thead><tr><th>Agent</th><th>Platform</th><th>Status</th><th>Last tool call</th><th>Scopes</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="mono">agent_muse_main</td>
+            <td>Meta Muse</td>
+            <td><span class="dot dot-green"></span>Active</td>
+            <td>2 min ago · <span class="mono">email.search</span></td>
+            <td><span class="mono">email:read calendar:read code:read</span></td>
+          </tr>
+          <tr>
+            <td class="mono">agent_grok_main</td>
+            <td>Grok Bot</td>
+            <td><span class="dot dot-green"></span>Active</td>
+            <td>26 min ago · <span class="mono">calendar.list</span></td>
+            <td><span class="mono">calendar:read calendar:write</span></td>
+          </tr>
+          <tr>
+            <td class="mono">agent_dots_trial</td>
+            <td>OpenAI Dots</td>
+            <td><span class="dot dot-grey"></span>Provisional</td>
+            <td>— never connected —</td>
+            <td><span class="mono">—</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head"><h2>Pending approvals</h2><a href="#">Open queue →</a></div>
+        <div class="approval">
+          <h3><span class="mono">email.send</span> — agent_muse_main <span class="badge b-amber">waiting 6 min</span></h3>
+          <div class="ctx">To: <span class="mono">vendor@example.com</span> · Subject: <span class="mono">Q4 vendor invoice — approval needed</span><br>
+          <span class="badge b-grey">untrusted content</span> · Rule: <span class="mono">sensitive-actions</span> · Expires in 9 min · 3 of 5 pending approvals used</div>
+          <button class="btn btn-approve" type="button">Approve · this call only</button><button class="btn btn-deny" type="button">Deny</button>
+        </div>
+        <div class="approval">
+          <h3><span class="mono">code.pr.open</span> — agent_grok_main <span class="badge b-amber">waiting 2 min</span></h3>
+          <div class="ctx">Repo: <span class="mono">kenhuangus/agentsec-scanner</span> · <span class="mono">feature/rate-limit</span> → <span class="mono">main</span><br>
+          <span class="badge b-grey">untrusted content</span> · Rule: <span class="mono">sensitive-actions</span> · Expires in 13 min · 3 of 5 pending approvals used</div>
+          <button class="btn btn-approve" type="button">Approve · this call only</button><button class="btn btn-deny" type="button">Deny</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>Policy summary</h2><a href="#">Edit policies →</a></div>
+        <ul class="policy-list">
+          <li><span><span class="mono">muse-read-only-email</span> — allow <span class="mono">email.search</span>, <span class="mono">email.read</span> for agent_muse_main</span><span class="badge b-green">allow</span></li>
+          <li><span><span class="mono">grok-calendar-write</span> — allow <span class="mono">calendar.create</span>, <span class="mono">calendar.update</span> for agent_grok_main</span><span class="badge b-green">allow</span></li>
+          <li><span><span class="mono">sensitive-actions</span> — require approval: <span class="mono">email.send</span>, <span class="mono">calendar.delete</span>, <span class="mono">code.pr.open</span></span><span class="badge b-amber">approval</span></li>
+          <li><span><span class="mono">block-external-recipients</span> — deny <span class="mono">email.send</span> outside allowlisted domains</span><span class="badge b-red">deny</span></li>
+          <li><span class="pinned">default-deny — no matching allow rule ⇒ denied (pinned, not editable)</span><span class="badge b-grey">deny</span></li>
+        </ul>
+        <div style="padding:10px 16px;color:var(--muted);font-size:12.5px;">Policy v14 · saved Oct 11, 2026 · dry-run clean against last 7 days</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Recent tool calls</h2><a href="#">Full audit log →</a></div>
+      <table>
+        <thead><tr><th>Time</th><th>Agent</th><th>Tool</th><th>Decision</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">15:13:02</td><td class="mono">agent_muse_main</td><td class="mono">email.search</td><td><span class="badge b-green">allowed</span></td></tr>
+          <tr><td class="mono">15:09:44</td><td class="mono">agent_muse_main</td><td class="mono">email.send</td><td><span class="badge b-amber">approval required</span></td></tr>
+          <tr><td class="mono">15:07:31</td><td class="mono">agent_grok_main</td><td class="mono">code.pr.open</td><td><span class="badge b-amber">approval required</span></td></tr>
+          <tr><td class="mono">14:58:19</td><td class="mono">agent_grok_main</td><td class="mono">calendar.list</td><td><span class="badge b-green">allowed</span></td></tr>
+          <tr><td class="mono">14:41:07</td><td class="mono">agent_muse_main</td><td class="mono">email.send</td><td><span class="badge b-blue">approved → executed</span></td></tr>
+          <tr><td class="mono">14:22:53</td><td class="mono">agent_grok_main</td><td class="mono">email.settings.write</td><td><span class="badge b-red">denied</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>Audit tail</h2><a href="#">Search &amp; export →</a></div>
+      <table>
+        <thead><tr><th>Time</th><th>Agent</th><th>Tool</th><th>Arguments (redacted)</th><th>Decision</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="mono">15:13:02</td><td class="mono">agent_muse_main</td><td class="mono">email.search</td>
+            <td><span class="mono">query="invoice", mailbox="inbox"</span></td>
+            <td><span class="badge b-green">allowed</span></td>
+          </tr>
+          <tr>
+            <td class="mono">15:09:44</td><td class="mono">agent_muse_main</td><td class="mono">email.send</td>
+            <td><span class="mono">to=<span class="redacted">[redacted:email]</span>, subject="Q4 vendor invoice…"</span></td>
+            <td><span class="badge b-amber">approval required</span></td>
+          </tr>
+          <tr>
+            <td class="mono">14:58:19</td><td class="mono">agent_grok_main</td><td class="mono">calendar.list</td>
+            <td><span class="mono">start="2026-10-12", end="2026-10-19"</span></td>
+            <td><span class="badge b-green">allowed</span></td>
+          </tr>
+          <tr>
+            <td class="mono">14:41:07</td><td class="mono">agent_muse_main</td><td class="mono">email.send</td>
+            <td><span class="mono">to=<span class="redacted">[redacted:email]</span>, approval=<span class="mono">apr_9f2k</span></span></td>
+            <td><span class="badge b-blue">approved → executed</span></td>
+          </tr>
+          <tr>
+            <td class="mono">14:22:53</td><td class="mono">agent_grok_main</td><td class="mono">email.settings.write</td>
+            <td><span class="mono">section="forwarding", settings=<span class="redacted">[redacted]</span></span></td>
+            <td><span class="badge b-red">denied</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <div style="padding:10px 16px;color:var(--muted);font-size:12.5px;">Append-only · retention 90 days · redaction applied before write</div>
+    </div>
+
+    <footer>Static mockup for design review — all names, times, and events are invented placeholder data.</footer>
+  </main>
+</div>
+
+</body>
+</html>

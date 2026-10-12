@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+# Virtualenv
+.venv/
+venv/
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+# SQLite databases (created at runtime; never commit live state)
+*.db
+*.db-wal
+*.db-shm
+data/
+# Secrets — never commit
+*.pem
+*.key
+.env
+# OPA sidecar socket / runtime
+*.sock
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+# Build
+dist/
+build/
+
+# OPA binary (69MB) — fetched + checksum-verified at build/CI time, not committed
+third_party/opa/opa

@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Vault &amp; Settings{% endblock %}
+{% block content %}
+<h1>Vault &amp; Settings</h1>
+
+<h2>Credential entries</h2>
+<p class="note">Metadata only — secrets never appear in the UI, errors, or audit (FR-022).</p>
+{% if entries is none %}
+<p class="note">Vault store not configured for this console process.</p>
+{% else %}
+<table>
+  <tr><th>Connector</th><th>Label</th><th>Status</th><th>Key ID</th><th>Created</th><th>Last rotated</th></tr>
+  {% for e in entries %}
+  <tr><td>{{ e.connector }}</td><td>{{ e.label }}</td><td><span class="badge {{ e.status }}">{{ e.status }}</span></td><td>{{ e.key_id }}</td><td>{{ e.created_at | localtime }}</td><td>{{ e.rotated_at | localtime }}</td></tr>
+  {% endfor %}
+</table>
+<h3>Rotate credential</h3>
+<form method="post" action="/settings/vault/rotate">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label>Connector <input name="connector" required></label>
+  <label>New secret <input type="password" name="new_cred" required autocomplete="new-password"></label>
+  <button type="submit" class="warn">Rotate</button>
+</form>
+{% endif %}
+
+<h2>Global settings</h2>
+<p class="note">Console-editable overrides; env vars remain the base values. MCP SDK floor (AC-10): <code>mcp {{ sdk_version }}</code> (floor ≥ 2.2.0). HMAC key: <code>{{ hmac_key_id }}</code>. Notifier: {{ "configured" if notifier_configured else "not configured (in-console fallback)" }}.</p>
+<table>
+  <tr><th>Setting</th><th>Env/base</th><th>Override</th><th>Effective</th><th>Action</th></tr>
+  {% for s in editable %}
+  <tr>
+    <td>{{ s.label }}</td><td><code>{{ s.env_value }}</code></td>
+    <td>{{ s.override if s.override is not none else "—" }}</td>
+    <td><strong>{{ s.effective }}</strong></td>
+    <td>
+      <form class="inline" method="post" action="/settings/update">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="key" value="{{ s.key }}">
+        <input name="value" size="6" value="{{ s.effective }}">
+        <button type="submit" class="ok">Set</button>
+      </form>
+      {% if s.override is not none %}
+      <form class="inline" method="post" action="/settings/reset">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="key" value="{{ s.key }}">
+        <button type="submit">Reset</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Redaction catalog</h2>
+<p class="note">Pattern-based PII/code-artifact redaction. Full <code>[redacted:type]</code> tokens — no last-4 hints.</p>
+<table>
+  <tr><th>Name</th><th>Category</th><th>Token</th><th>Enabled</th><th>Actions</th></tr>
+  {% for p in patterns %}
+  <tr>
+    <td><code>{{ p.name }}</code><br><span class="note">{{ p.description }}</span></td>
+    <td>{{ p.category }}</td><td><code>{{ p.token }}</code></td>
+    <td>{{ "yes" if p.enabled else "no" }}</td>
+    <td>
+      <form class="inline" method="post" action="/settings/redaction/toggle">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="name" value="{{ p.name }}">
+        <input type="hidden" name="enabled" value="{{ "false" if p.enabled else "true" }}">
+        <button type="submit">{{ "Disable" if p.enabled else "Enable" }}</button>
+      </form>
+      <form class="inline" method="post" action="/settings/redaction/delete">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="name" value="{{ p.name }}">
+        <button type="submit" class="danger" onclick="return confirm('Delete pattern {{ p.name }}?');">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<h3>Add pattern</h3>
+<form method="post" action="/settings/redaction/add">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="filters">
+    <label>Name <input name="name" required></label>
+    <label>Regex <input name="regex" required size="40"></label>
+    <label>Token <input name="pattern_mask" placeholder="[redacted:custom]" size="20"></label>
+    <label>Category <select name="category"><option value="pii">pii</option><option value="code_artifact">code_artifact</option></select></label>
+  </div>
+  <label>Description <input name="description" size="60"></label>
+  <button type="submit" class="ok">Add pattern</button>
+</form>
+
+<h2>Recorded decision criteria (per domain)</h2>
+<p class="note">Ken's decision criteria per domain, referenced on approval cards (FR-PAA09-004).</p>
+<table>
+  <tr><th>Domain</th><th>Criteria</th><th>Updated</th><th>Action</th></tr>
+  {% for c in criteria %}
+  <tr>
+    <td><code>{{ c.domain }}</code></td>
+    <td><pre class="args">{{ c.criteria | tojson(indent=2) }}</pre></td>
+    <td>{{ c.updated_at | localtime }}</td>
+    <td>
+      <form class="inline" method="post" action="/settings/criteria/delete">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="domain" value="{{ c.domain }}">
+        <button type="submit" class="danger" onclick="return confirm('Delete criteria for {{ c.domain }}?');">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<h3>Set criteria for a domain</h3>
+<form method="post" action="/settings/criteria/upsert">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label>Domain <input name="domain" required placeholder="email.send"></label>
+  <label>Criteria (JSON) <textarea name="criteria_json" rows="5" placeholder='{"max_recipients": 5, "notes": "..."}'></textarea></label>
+  <p><button type="submit" class="ok">Save criteria</button></p>
+</form>
+{% endblock %}

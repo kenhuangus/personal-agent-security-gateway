@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Connectors{% endblock %}
+{% block content %}
+<h1>Connectors</h1>
+<p class="note">Connector registry: tools exposed, upstream scopes, and health (credential-valid + API-reachable, checked every 5 minutes).</p>
+
+<form method="post" action="/connectors/check">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit" class="ok">Run health checks now</button>
+</form>
+
+<table>
+  <tr><th>Connector</th><th>Health</th><th>Credential</th><th>API</th><th>Detail</th><th>Last checked</th><th>Tools</th></tr>
+  {% for c in connectors %}
+  <tr>
+    <td><strong>{{ c.name }}</strong></td>
+    <td>{% if c.healthy is none %}<span class="note">not checked yet</span>{% elif c.healthy %}<span class="badge healthy">healthy</span>{% else %}<span class="badge unhealthy">UNHEALTHY</span>{% endif %}</td>
+    <td>{% if c.credential_valid is none %}—{% elif c.credential_valid %}valid{% else %}<strong>invalid</strong>{% endif %}</td>
+    <td>{% if c.api_reachable is none %}—{% elif c.api_reachable %}reachable{% else %}<strong>unreachable</strong>{% endif %}</td>
+    <td>{{ c.detail }}</td>
+    <td>{{ c.checked_at | localtime }}</td>
+    <td>{{ c.tools | join(", ") }}<br><span class="note">scopes: {{ c.scopes | join(", ") }}</span></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
