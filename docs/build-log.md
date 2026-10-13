@@ -1670,3 +1670,326 @@ model). No kev code was copied, ported, or vendored into the gateway;
 the driver was written from the documented contract and corrected
 against the live wire. GPL-3.0 avoidance (personal-ontology) is
 unaffected — the kev repo is Apache-2.0, not GPL.
+
+---
+
+# 2026-10-13 — Hackathon readiness build (3 workstreams, coordinator-integrated)
+
+
+# Build log fragment — workstream 1 (one-command `docker compose up`)
+
+Date: 2026-10-13. Author: ws1 worker. The coordinator merges this into
+docs/build-log.md at the end; do not edit build-log.md directly.
+
+## What was built
+
+`docker compose up --build` (repo root) brings up a working gateway with a
+seeded demo: `gateway` (MCP on host :8000) + `opa` (openpolicyagent/opa:1.8.0,
+pinned to OPA_VERSION) + `kev` (kev-0.8b model server on the compose network,
+:8009).
+
+**New files**
+- `docker-compose.yml` — the three services, two named volumes
+  (`kev-models`, `gateway-data`), one bridge network.
+- `docker/gateway/Dockerfile` + `docker/gateway/entrypoint.sh` —
+  python:3.12-slim, non-root `appuser`, vendored OPA binary installed to
+  `/usr/local/bin/opa` (`GATEWAY_OPA_BIN`; also used by the save-time
+  `opa check` gate), demo HMAC key generation (0600, first boot), idempotent
+  seed, then `python -m gateway.mcp_server`.
+- `docker/kev/Dockerfile` + `docker/kev/entrypoint.sh` — CPU torch wheel
+  installed directly (no resolver backtracking), uv.lock-pinned deps,
+  `kev.serve` from upstream pinned to commit
+  `85ccf56a0afb952323c621055b02876e8498d60c` (the checkout the wire
+  corrections were verified against). Weights NOT in the image: first boot
+  downloads `jaredpalmer/kev-0.8b` + `Qwen/Qwen3.5-0.8B-Base` into the
+  `kev-models` volume, verifies byte-exact sizes (43338624 / 1746942600 /
+  2103999), patches `head.pt` `meta.base` to the local base dir (mirrors
+  `~/workspace/kev-serve/patch_head_base.py`), serves with
+  `--host 0.0.0.0 --port 8009 --device cpu`. Applies the no_proxy
+  bracketed-IPv6 sanitizing and TMPDIR-on-big-disk lessons.
+- `scripts/seed_demo.py` — idempotent seed: `demo-agent` (Fix-A OAuth
+  credential), default read-only mandate + demo mandate (`demo.read`,
+  `demo.write`, `gateway.*`), policy v1 (explicit allow for demo.read;
+  demo.write left to the pinned default-deny), OPA readiness wait, and a
+  self-check through the real PolicyEngine (allow + deny) before SEED_OK.
+  Credentials go to `<config-db-dir>/demo-credentials.env` (0600).
+- `scripts/compose_smoke.sh` — acceptance gate: `up -d --build`, wait for
+  `/healthz`, read demo creds, MCP handshake + `tools/list`, assert
+  `demo.read` → ALLOW and `demo.write` → DENY (`policy_denied`), non-fatal
+  kev reachability probe from the gateway container, then `down -v`.
+  NOT executed here (no docker on this VM) — must run on a docker host.
+- `src/gateway/demo_tools.py` — `demo.read`/`demo.write` (routine, canned
+  responses); registered only when `GATEWAY_DEMO_TOOLS=1` (mcp_server.py).
+  Default off; never for production.
+- `tests/test_opa_external.py` — 7 tests for the new external mode.
+
+**Changed files**
+- `src/gateway/opa_client.py` — added the `GATEWAY_OPA_URL` external mode
+  (option (a) from the brief): when set, no sidecar subprocess is launched
+  and no binary is resolved; `start()` becomes a readiness probe and
+  `decide()` POSTs to the URL. Fail-closed contract identical
+  (any failure → OpaUnavailable → deny). The Rego decision contract is
+  untouched. `shared_opa_client()` (policy.py) picks it up automatically via
+  env, so no policy.py changes were needed.
+- `src/gateway/mcp_server.py` — demo-tools registration behind
+  `GATEWAY_DEMO_TOOLS=1`.
+- `README.md` — "One-command demo" section (services, ports, env vars, seed,
+  smoke test, judge-wired-but-off note).
+
+## Design decisions
+- External OPA mode (a) over sidecar-in-gateway-container (b): matches how
+  deployments actually run OPA; the vendored binary stays in the gateway
+  image as the standalone fallback (`GATEWAY_OPA_BIN`).
+- The `opa` compose service has no healthcheck: the official image is
+  scratch-based (no shell/curl/wget). The gateway's readiness probe gates
+  instead, and the seed retries 3x.
+- Judge is wired (`GATEWAY_JUDGE_BACKEND=kev`,
+  `GATEWAY_JUDGE_KEV_URL=http://kev:8009`) but hooks stay OFF
+  (`GATEWAY_JUDGE_ENABLED=0` default): opt-in, advisory-only, and the AC-11
+  latency budget is measured with the judge off. Flip one var to exercise it.
+- kev's port is NOT published to the host (compose-network only); the smoke
+  probes it from the gateway container.
+- Entrypoint generates a demo `GATEWAY_HMAC_KEY` (persisted 0600) when unset
+  so the approval flow works out of the box; production must use the secret
+  store.
+
+## Validation (this VM — no docker, so the smoke test was NOT executed)
+- `tests/test_opa_external.py`: 7 passed (fake OPA server: decide,
+  env-var mode, malformed/unreachable/unhealthy → OpaUnavailable,
+  bad scheme, trailing-slash strip).
+- `tests/test_rego.py`: 58 passed (sidecar mode — no regression).
+- `tests/test_policy.py` + `tests/test_foundation.py`: 118 passed
+  (mcp_server change — no regression; includes the live-wire MCP tests).
+- `scripts/seed_demo.py` run locally against temp DBs with the vendored
+  sidecar OPA: SEED_OK (agent, mandates, policy v1, self-check
+  allow+deny, creds file 0600); re-run is a clean no-op.
+- Full MCP path validated locally (throwaway script, not committed):
+  fresh DB → seed → GatewayApp(GATEWAY_DEMO_TOOLS=1) over ASGI →
+  initialize, tools/list (3 tools), `demo.read` → ALLOW,
+  `demo.write` → DENY (`policy_denied`). This mirrors exactly what
+  `scripts/compose_smoke.sh` asserts against the compose stack.
+- Static: `yaml.safe_load` on docker-compose.yml; `bash -n` on all three
+  shell scripts; Dockerfiles reviewed against best practices (pinned
+  versions, no secrets, non-root gateway user, minimal layers, .dockerignore
+  n/a — selective COPYs). shellcheck is not installed on this VM; scripts
+  were manually reviewed (quoting, `set -euo pipefail`, no unbound vars).
+- Live kev-0.8b server on 127.0.0.1:8009 was NOT disturbed (never started a
+  second one); no live judge calls were made by this workstream.
+
+## Must be verified on a docker host
+1. `docker compose up --build` then `./scripts/compose_smoke.sh` — the
+   acceptance gate (NOT run here).
+2. First-boot kev weight download (~1.8GB) + `head.pt` patch + serve
+   (entrypoint logic reviewed, not executed).
+3. `openpolicyagent/opa:1.8.0` tag pulls (follows the official unprefixed
+   semver convention; binary 1.8.0 is checksum-pinned in-repo).
+
+## Invariants held
+- Rego decision contract unchanged (policy decides; judge advisory-only).
+- Fail-closed everywhere (external OPA failures → OpaUnavailable → deny;
+  seed failures never block the server from starting closed).
+- No secrets/API keys in the repo or tests (demo creds are generated at
+  runtime into a docker volume, 0600).
+- No model weights committed; no code copied from other repos
+  (kev.serve installed from upstream at image build).
+- No commits made; build-log.md untouched (this fragment instead).
+
+
+# Build log fragment — Workstream 2: latency dashboard (AC-11)
+
+Date: 2026-10-13. Worker: WS2. Not committed (orchestrator merges).
+
+## What was built
+
+In-memory latency instrumentation + an admin-console "Latency" page proving
+the p95 story live.
+
+New files:
+- `src/gateway/latency.py` — `LatencyRecorder`: bounded ring buffer
+  (`collections.deque`, maxlen 1000 per stage), thread-safe via lock,
+  recording `(stage, latency_ms, timestamp, label)` spans; nearest-rank
+  p50/p95/max/count statistics. No new dependencies. Module-level
+  `recorder` is the process-wide instance; `record()` helper.
+  `AC11_BUDGET_MS = 100.0`.
+- `src/gateway/console/templates/latency.html` — Latency page: per-stage
+  table (samples, p50, p95, max, label histogram), 100 ms AC-11 budget
+  line, p95 over budget highlighted red (badge), judge-backend summary
+  table (backend / enabled / always-on / escalation / timeout) read from
+  Settings. Empty buffer renders an honest "No data yet" state — no
+  placeholders anywhere.
+- `tests/test_latency.py` — 18 tests (see below).
+
+Modified (surgical only; no decision logic, ordering, or error handling touched):
+- `src/gateway/policy.py` — `PolicyEngine.evaluate_intent`: times ONLY the
+  `opa.decide(input_doc)` call; records a `policy` span labeled with the
+  decision effect (`allow` / `deny` / `require_approval`, mapping Rego
+  `ask` → `require_approval` via `_policy_effect_label`), or
+  `opa_unavailable` / `opa_error` on the fail-closed paths.
+- `src/gateway/pipeline.py` — `Pipeline.execute` loop: after each stage
+  runs, when `stage.name == "inspect_output"` records an `inspection`
+  span from the already-measured `stage:inspect_output` timing span (no
+  second timer), labeled `ok` or the halting error code.
+- `src/gateway/judge/cascade.py` — `decide()` renamed body to
+  `_decide_inner()`; new `decide()` records one `judge` span per
+  successful cascade reusing `CascadeResult.latency_ms` (no second
+  timer), label = backend path (`kev`, `kev|glimmer:escalated`,
+  `kev:low_confidence`). Failed cascades (JudgeUnavailable) record
+  nothing; judge-disabled → never called → nothing recorded.
+- `src/gateway/console/pages.py` — `register_latency(app, settings, csrf)`
+  (`GET /latency`, follows the dashboard page pattern: CSRF token +
+  cookie, `_RENDER`), wired into `register_m6_pages`.
+- `src/gateway/console/templates/base.html` — nav link "Latency" after
+  Dashboard.
+
+## Tests
+
+- `tests/test_latency.py`: 18 passed — recorder stage labels, label
+  histogram, buffer boundedness, thread-safety (8 threads × 100),
+  p50/p95/max/count on known populations (1..100 and a mixed 90/10
+  population), empty-buffer → None, `_policy_effect_label` mapping,
+  cascade records its own latency_ms (stats max == result.latency_ms),
+  failed cascade records nothing, pipeline loop records inspection spans
+  with `ok` / error-code labels, console page: empty → "No data yet",
+  synthetic data → real numbers rendered, judge backend line reflects
+  settings (`none` default; `kev`+enabled variant).
+- Targeted regression on all suites touching modified files:
+  `test_latency + test_judge_cascade + test_judge + test_policy + test_console`:
+  **186 passed**.
+
+## Verified live (not just in tests)
+
+- Real OPA sidecar: 5× `PolicyEngine.evaluate_intent` (no rules → pinned
+  default-deny) recorded 5 real `policy` spans, labels `deny`, p50 ≈ 4 ms,
+  p95 ≈ 324 ms (first call includes sidecar startup — the page shows this
+  honestly).
+- Live kev-0.8b server (127.0.0.1:8009, NOT restarted — reused): real
+  `JudgeCascade.decide` answered `no` (conf 0.517, low_confidence) in
+  4011.42 ms; recorded span = exactly the cascade's `latency_ms`
+  (stats max matched to the microsecond), label `kev:low_confidence`.
+
+## Measured overhead
+
+`record()`: ~4.4 µs per span (perf_counter + lock + deque append).
+`stats()` over a full 1000-sample buffer: ~0.10 ms per call (console
+read path only, never on the hot path). Negligible against the 100 ms
+AC-11 budget; the instrumentation itself does not touch the budget.
+
+## Standing invariants
+
+- Fix A / Fix B untouched; Rego decision contract unchanged (judge is
+  advisory-only, spans are observability-only, never decision inputs);
+  fail-closed paths record a labeled span but decide identically; no
+  secrets in repo or tests; no code copied from other repos.
+
+## Deferred / notes for the merge
+
+- Escalation backend: the page reads `settings.judge_escalation` (the
+  name WS3 used in config.py) via getattr with a `"none"` default —
+  verified compatible with WS3's in-flight `GATEWAY_JUDGE_ESCALATION`
+  setting.
+- `execute_approved_call` (MF-11 replay path) also runs InspectOutputStage
+  but was deliberately NOT instrumented — kept the change to the main
+  `Pipeline.execute` loop per the surgical-touch rule. Easy to add later
+  if the replay path's latency matters.
+- The p95 on a cold process includes OPA sidecar startup on the first
+  policy call — real data, worth mentioning in the demo ("warm" numbers
+  settle after the first call).
+
+
+# Build log fragment — workstream 3: LLM (Glimmer) escalation backend (2026-10-13)
+
+**Owner:** WS3 (do not append to build-log.md directly; orchestrator merges).
+
+## What was built
+
+- `src/gateway/judge/llm_escalation.py` (new): `LlmEscalationBackend`, a
+  `DecisionBackend` over any OpenAI-compatible `POST {base}/v1/chat/completions`
+  endpoint. Defaults: base `http://127.0.0.1:11434` (Ollama; vLLM/SGLang by
+  changing the URL), model `meta-models/Muse-Glimmer-30B`, optional API key.
+  Backend name `"llm"`.
+  - Strict prompt: demands exactly one JSON object mapping each question name
+    to `{"label", "confidence"}`; declared labels (yes/no, option names, level
+    names) embedded verbatim.
+  - Strict parse: valid JSON object only (markdown fences rejected); every
+    asked question present, no extras; each entry exactly label/confidence
+    keys; labels case-insensitively matched to canonical; confidence a number
+    in [0,1] (bools, strings, NaN/out-of-range rejected). ANY violation →
+    `JudgeUnavailable`. Empty question batch → `JudgeUnavailable`.
+  - Probability mapping documented as a normalized SELF-REPORT (chosen label
+    gets stated confidence, remainder split uniformly) — NOT a calibrated
+    distribution like Kev's. Code comments, module docstring, and README say
+    this explicitly: Glimmer 30B is a generative chat model, NOT a
+    /v1/systemone decision model; this backend is an adapter. No pretense
+    anywhere in code, docs, or logs.
+  - Fail-closed transport: `httpx.Client(trust_env=False)` (same loopback/
+    proxy lesson as `_wire.py`/`opa_client.py`), timeouts and all HTTP errors
+    → `JudgeUnavailable`. Test seam: `transport=` constructor arg (tests
+    inject `httpx.MockTransport`; never a real endpoint).
+- `src/gateway/config.py` (additive): `GATEWAY_JUDGE_ESCALATION`
+  (none|jev|llm, default none), `GATEWAY_LLM_ESCALATION_URL`,
+  `GATEWAY_LLM_ESCALATION_MODEL`, `GATEWAY_LLM_ESCALATION_API_KEY`;
+  `validate()` flags unknown escalation names. All default-off.
+- `src/gateway/judge/factory.py` (additive): `escalation_from_settings()`
+  + `ESCALATIONS` tuple. Unknown name or llm-without-URL/model raises
+  `ValueError` at construction (matches `backend_from_settings`).
+- `src/gateway/pipeline.py` (surgical): `_judge_wiring` passes
+  `escalation=escalation_from_settings(settings)` into the cascade (was
+  hardcoded `None`). Primary stays Kev; LLM is escalation-only.
+- `tests/test_judge_llm_escalation.py` (new): 44 tests, mocks only.
+- `README.md` (additive): env-var rows + "Judge escalation backend (llm)"
+  section with the honest GPU note and the deploy-target live-validation
+  follow-up.
+
+## Test results
+
+- `tests/test_judge_llm_escalation.py`: **44 passed** (prompt construction
+  labels-verbatim, strict parsing: valid/case-fold/invalid-JSON/fence/
+  missing/extra-question/extra-entry-key/unknown-label/non-string-label/
+  out-of-range/string/bool confidence/non-object-entry/non-object-top-level;
+  probability mapping incl. degenerate single-label fail-closed; decide()
+  happy path incl. `/v1/chat/completions` path + model + Bearer header only
+  when key set; transport fail-closed: connect error, timeout, HTTP 500,
+  malformed JSON, non-chat-completions shape, missing content; cascade
+  integration: low-confidence primary → escalation wins with escalated=True;
+  LLM failure → JudgeUnavailable propagates; high-confidence primary never
+  calls the LLM; factory: none→None, llm→backend, unknown→ValueError,
+  missing URL/model→ValueError, jev missing URL/key→ValueError; config
+  validate: unknown flagged, valid pass).
+- `tests/test_judge.py`: **44 passed** (no regressions in existing judge
+  behavior after config/factory changes).
+- `tests/test_judge_cascade.py`: could not run — workstream 2's in-flight
+  latency-dashboard edit left `src/gateway/pipeline.py` with a syntax error
+  at line 46 (`from .latency import recordfrom .inspection.rate_limit ...`),
+  unrelated to WS3's `_judge_wiring` edits (which are intact and correct in
+  git diff). Orchestrator's final full-suite run will cover it.
+
+## Verified live vs tests vs documented-for-later
+
+- **Verified in tests (mocks only):** everything above. No network, no GPU.
+- **Verified live:** wiring smoke against real Python runtime — `Settings()`
+  defaults (`judge_escalation='none'` → `escalation_from_settings` returns
+  `None`), `GATEWAY_JUDGE_ESCALATION=llm` → builds `LlmEscalationBackend`
+  with correct base/model, `validate()` clean. The pre-existing live
+  kev-0.8b server on 127.0.0.1:8009 was NOT touched by WS3 (per brief:
+  never start a second one; no live judge calls were needed).
+- **Documented for later (deploy target):** live validation of the
+  escalation path against a REAL Glimmer-30B endpoint. This VM (7 GB RAM,
+  no GPU) cannot download or run Glimmer-30B (~24 GB VRAM quantized).
+  Required before production escalation use: stand up Ollama (or
+  vLLM/SGLang) with `meta-models/Muse-Glimmer-30B` on a GPU host, point
+  `GATEWAY_LLM_ESCALATION_URL`/`_MODEL` at it, enable
+  `GATEWAY_JUDGE_ESCALATION=llm` with the judge hooks on, and confirm
+  end-to-end (verdict parse rate, escalation latency vs AC-11 budget,
+  honest confidence behavior on adversarial tool outputs). README carries
+  this as an explicit follow-up.
+
+## Invariants held
+
+- No commits; no writes to `docs/build-log.md` (this fragment instead).
+- Additive, default-off changes to config.py/pipeline.py; existing
+  judge tests green.
+- Judge stays advisory-only (never in front of Rego); fail-closed
+  everywhere; no secrets/API keys in repo or tests (key only via env at
+  runtime, `repr=False` in Settings); no code copied from other repos
+  (adapter written from the OpenAI chat-completions contract).
+

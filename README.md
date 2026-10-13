@@ -57,6 +57,69 @@ cd ~/workspace/mcp-gateway
 107 tests, all green (2026-10-12: 73 M1 + 34 M4 vault). The `TestMcpWire` class boots a real
 uvicorn server on an ephemeral port and speaks raw Streamable HTTP JSON-RPC.
 
+## One-command demo (`docker compose up --build`)
+
+A reviewer or future customer gets a working gateway with a seeded demo from one
+command (repo root):
+
+```bash
+docker compose up --build
+```
+
+What comes up:
+
+| Service | Image | What it is |
+|---|---|---|
+| `gateway` | built from `docker/gateway/Dockerfile` (python:3.12-slim) | the MCP control plane; Streamable HTTP on host `:8000` |
+| `opa` | `openpolicyagent/opa:1.8.0` (**pinned** — must match `OPA_VERSION` in `src/gateway/opa_client.py`) | policy decision point; serves the versioned Rego bundle mounted read-only from `./src/gateway/policies/v1` |
+| `kev` | built from `docker/kev/Dockerfile` (python:3.12-slim) | kev-0.8b decision-model server for the opt-in judge cascade; serves `:8009` inside the compose network only |
+
+First boot, the gateway entrypoint (`docker/gateway/entrypoint.sh`) runs the
+idempotent demo seed (`scripts/seed_demo.py`): registers the `demo-agent`
+identity (Fix-A OAuth credential), creates the default read-only standing
+mandate plus a demo mandate, saves policy version 1 (explicit allow for
+`demo.read`; `demo.write` deliberately uncovered so it hits the pinned
+default-deny), and writes the one-time credentials to `/data/demo-credentials.env`
+(mode 0600, inside the `gateway-data` volume).
+
+The kev entrypoint (`docker/kev/entrypoint.sh`) downloads weights from
+HuggingFace on first boot into the `kev-models` named volume (never baked into
+the image): the `jaredpalmer/kev-0.8b` adapter (~45 MB) + the
+`Qwen/Qwen3.5-0.8B-Base` base (~1.7 GB), verifies byte-exact sizes, patches
+`head.pt`'s `meta.base` to the local base dir, then serves
+`KEV_DTYPE=bf16 python -u -m kev.serve --run /models/kev-0.8b --host 0.0.0.0 --port 8009 --device cpu`.
+`kev.serve` is installed from upstream (Apache-2.0, pinned commit
+`85ccf56a0afb952323c621055b02876e8498d60c`) — no kev code is vendored in this repo.
+The kev service needs ~2 GB RAM on the docker host.
+
+Smoke test (the acceptance gate — asserts one ALLOW and one DENY through the
+real MCP endpoint, then tears the stack down):
+
+```bash
+./scripts/compose_smoke.sh   # must run on a docker host
+```
+
+Demo-only env vars (namespaced, default-off/safe; set in `docker-compose.yml`,
+not in the image):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `GATEWAY_OPA_URL` | (empty) | **compose:** `http://opa:8181` — external OPA mode: no sidecar subprocess, decisions go to the URL; identical fail-closed contract. Empty = sidecar mode (default). |
+| `GATEWAY_SEED_DEMO` | `0` | `1` = run the demo seed at container boot (idempotent). |
+| `GATEWAY_DEMO_TOOLS` | (empty) | `1` = register `demo.read` (seeded allow) + `demo.write` (default-deny) on the MCP surface. Demo only — never enable in production. |
+| `GATEWAY_HMAC_KEY` | (empty) | compose: when empty, the entrypoint generates + persists a demo key (0600, first boot) so the approval flow works. Production MUST set this from the platform secret store. |
+
+Notes:
+- The judge is **wired but off** in the demo: `GATEWAY_JUDGE_BACKEND=kev` +
+  `GATEWAY_JUDGE_KEV_URL=http://kev:8009`, while `GATEWAY_JUDGE_ENABLED` stays
+  `0` (default). Flip it to `1` to exercise the advisory judge cascade against
+  the live model.
+- `docker compose down -v` drops both named volumes (fresh seed + fresh weight
+  download on the next `up`).
+- The `opa` service has no healthcheck: the official image is scratch-based (no
+  shell/curl). The gateway's `OpaClient` readiness probe (`GATEWAY_OPA_URL` mode)
+  gates on OPA before serving decisions.
+
 ## Environment variables
 
 | Variable | Default | Notes |
@@ -80,6 +143,11 @@ uvicorn server on an ephemeral port and speaks raw Streamable HTTP JSON-RPC.
 | `GATEWAY_REFUSAL_COOLDOWN_H` | `24` | post-denial refusal cooldown (M3) |
 | `GATEWAY_AUDIT_RETENTION_DAYS` | `90` | audit retention |
 | `GATEWAY_HOST` / `GATEWAY_PORT` | `127.0.0.1` / `8000` | server bind |
+| `GATEWAY_JUDGE_BACKEND` | `none` | **JUDGE (opt-in):** judge primary — `none`\|`kev`\|`jev` |
+| `GATEWAY_JUDGE_ESCALATION` | `none` | **JUDGE (opt-in):** cascade escalation — `none`\|`jev`\|`llm` (see below) |
+| `GATEWAY_LLM_ESCALATION_URL` | `http://127.0.0.1:11434` | **JUDGE:** OpenAI-compatible chat-completions base (Ollama default; vLLM/SGLang by URL) |
+| `GATEWAY_LLM_ESCALATION_MODEL` | `meta-models/Muse-Glimmer-30B` | **JUDGE:** escalation model id |
+| `GATEWAY_LLM_ESCALATION_API_KEY` | (empty) | **JUDGE:** optional key for hosted endpoints (Ollama needs none) |
 
 No real secrets are stored in the repo. Ever.
 
@@ -93,6 +161,42 @@ Per-agent secret over TLS; no third rung (Fix A):
 The credential is validated on **every** request (the session ID alone never
 suffices). The gateway-as-OAuth-authorization-server code exchange arrives in a
 later milestone; `mock_oauth.py` covers the token shape for tests.
+
+## Judge escalation backend (`llm`) — bring-your-own escalation model
+
+The judge cascade runs Kev-4B as the fast, calibrated **primary**. When the
+primary is low-confidence or unavailable, an optional **escalation** backend
+re-decides and its answers win (`escalated=True`); if the escalation fails,
+the exception propagates and the caller falls back to the deterministic `ask`
+path. The judge stays advisory-only: it never sits in front of Rego policy.
+
+`GATEWAY_JUDGE_ESCALATION=llm` wires a generic OpenAI-compatible
+chat-completions adapter (`src/gateway/judge/llm_escalation.py`) as the
+escalation layer. The **validated target** is
+`meta-models/Muse-Glimmer-30B` (Apache-2.0) served via Ollama
+(`ollama pull hf.co/meta-models/Muse-Glimmer-30B`), vLLM, or SGLang —
+all expose `POST /v1/chat/completions`.
+
+Be technically honest about what this is: Muse Glimmer 30B is a
+**generative agentic chat model, NOT a `/v1/systemone` decision
+model**. The adapter asks it for a strict JSON verdict (one
+`{"label", "confidence"}` per question, labels restricted to the
+declared set) and parses strictly — any unparseable, missing, or
+out-of-range field raises `JudgeUnavailable` and the call fails
+closed. The returned "probabilities" are a normalized self-report
+(chosen label gets its stated confidence, remainder split uniformly),
+**not a calibrated distribution like Kev's**. This is why the LLM is
+escalation-only: it gets a second opinion when the calibrated model
+is uncertain, never the primary vote.
+
+**GPU note (deploy-target task):** Glimmer-30B needs ~24 GB VRAM
+quantized — this build's 7 GB, no-GPU VM cannot download or run it.
+The backend is implemented and mock-tested here; live validation
+against a real Glimmer-30B endpoint (deploy target with a GPU, or a
+hosted OpenAI-compatible endpoint) is an explicit follow-up before
+any production escalation use. Ollama is the recommended path:
+`GATEWAY_LLM_ESCALATION_URL=http://127.0.0.1:11434`
+`GATEWAY_LLM_ESCALATION_MODEL=meta-models/Muse-Glimmer-30B`.
 
 ## M0 spike summary
 

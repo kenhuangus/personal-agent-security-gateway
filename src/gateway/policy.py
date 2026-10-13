@@ -61,6 +61,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
@@ -72,6 +73,7 @@ from sqlalchemy.orm import Session
 from .errors import make_error, policy_denied
 from .intent import Intent, intent_from_parts, normalize_intent
 from .judge.risk import apply_risk_step_up
+from .latency import record
 from .models import Agent, Mandate, PolicyRule, PolicyVersion
 from .ontology import integration as _ontology
 from .ontology.models import (
@@ -776,6 +778,21 @@ def shared_opa_client() -> OpaClient:
 # Policy engine
 # ---------------------------------------------------------------------
 
+
+def _policy_effect_label(decision: Any) -> str:
+    """Latency-span label for an OPA decision.
+
+    The Rego vocabulary is ``allow`` | ``deny`` | ``ask``; the span
+    label uses the gateway's decision vocabulary (``ask`` ->
+    ``require_approval``) so the latency page reads consistently with
+    the audit log. Anything unexpected is labeled verbatim — a span
+    label is observability only, never a decision input.
+    """
+    effect = decision.get("effect") if isinstance(decision, dict) else None
+    if effect == "ask":
+        return "require_approval"
+    return str(effect) if effect else "unknown"
+
 # M3 seam: grant_checker(agent_id, tool, argument_hash, db) ->
 # Optional[Union[str, GrantCheckResult]].
 # Returns a grant reference when an active one-time grant covers the
@@ -1144,10 +1161,20 @@ class PolicyEngine:
         snapshot_id = input_doc["data_snapshot_id"]
 
         # --- OPA decision (fail-closed) ----------------------------------
+        # AC-11 latency instrumentation: time ONLY the OPA decide call
+        # (the policy-path budget); the span is labeled with the
+        # decision effect, or the fail-closed marker when the call
+        # itself failed. Recording is advisory — it never changes the
+        # decision, ordering, or error handling below.
         opa = self.opa_client or shared_opa_client()
+        _t0 = time.perf_counter()
         try:
             decision = opa.decide(input_doc)
         except OpaUnavailable as exc:
+            record(
+                "policy", (time.perf_counter() - _t0) * 1000.0,
+                label="opa_unavailable",
+            )
             # 03 §7: policy-engine failure -> default-deny (FR-017).
             # The agent-visible reason stays the safe "no_allow_rule";
             # scope_rule="opa_unavailable" is internal-only (audit).
@@ -1158,12 +1185,20 @@ class PolicyEngine:
                 data_snapshot_id=snapshot_id,
             )
         except Exception:  # noqa: BLE001 — any unexpected error denies
+            record(
+                "policy", (time.perf_counter() - _t0) * 1000.0,
+                label="opa_error",
+            )
             log.exception("OPA decide raised unexpectedly (fail closed)")
             return EvaluationResult(
                 "deny", None, False, policy_version=version_number,
                 scope_rule="opa_unavailable",
                 data_snapshot_id=snapshot_id,
             )
+        record(
+            "policy", (time.perf_counter() - _t0) * 1000.0,
+            label=_policy_effect_label(decision),
+        )
 
         return self._result_from_decision(
             decision, input_doc, ont_state, id_to_name, intent, agent, tool,

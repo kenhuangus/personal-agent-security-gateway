@@ -136,6 +136,32 @@ class Settings:
     judge_jev_api_key: str = field(
         default_factory=lambda: _env("GATEWAY_JUDGE_JEV_API_KEY", ""), repr=False
     )
+    # --- judge escalation (ESCALATION build; OPT-IN, default OFF) ---
+    # "none" (default) = no escalation backend: low-confidence primary
+    # answers return low_confidence=True → the caller maps it to the
+    # deterministic ask path. "jev" = TypeSafe hosted Jev as the
+    # escalation backend. "llm" = bring-your-own escalation model over
+    # an OpenAI-compatible chat-completions endpoint (validated target:
+    # meta-models/Muse-Glimmer-30B via Ollama/vLLM/SGLang). The
+    # PRIMARY stays Kev; the LLM is escalation-only, exactly as the
+    # cascade was designed.
+    judge_escalation: str = field(
+        default_factory=lambda: _env("GATEWAY_JUDGE_ESCALATION", "none")
+    )
+    judge_llm_escalation_url: str = field(
+        default_factory=lambda: _env(
+            "GATEWAY_LLM_ESCALATION_URL", "http://127.0.0.1:11434"
+        )
+    )
+    judge_llm_escalation_model: str = field(
+        default_factory=lambda: _env(
+            "GATEWAY_LLM_ESCALATION_MODEL", "meta-models/Muse-Glimmer-30B"
+        )
+    )
+    judge_llm_escalation_api_key: str = field(
+        default_factory=lambda: _env("GATEWAY_LLM_ESCALATION_API_KEY", ""),
+        repr=False,
+    )
     # Per-decide timeout (seconds); consumed at the decide() call site,
     # not by the factory — the cascade passes settings.judge_timeout_s.
     judge_timeout_s: float = field(
@@ -177,6 +203,11 @@ class Settings:
             problems.append(
                 f"GATEWAY_JUDGE_BACKEND={self.judge_backend!r} is not one of "
                 "none|kev|jev"
+            )
+        if self.judge_escalation.strip().lower() not in ("none", "jev", "llm"):
+            problems.append(
+                f"GATEWAY_JUDGE_ESCALATION={self.judge_escalation!r} is not one of "
+                "none|jev|llm"
             )
         if self.judge_timeout_s <= 0:
             problems.append("GATEWAY_JUDGE_TIMEOUT_S must be > 0")

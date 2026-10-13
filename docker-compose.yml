@@ -1,0 +1,102 @@
+# Personal Agent Security Gateway — one-command demo.
+#
+#   docker compose up --build
+#
+# Services:
+#   gateway  the MCP control plane (Streamable HTTP on host :8000)
+#   opa      policy decision point (openpolicyagent/opa — version PINNED to
+#            OPA_VERSION in src/gateway/opa_client.py)
+#   kev      kev-0.8b decision-model server for the opt-in judge cascade
+#            (weights download to the kev-models volume on first boot)
+#
+# The smoke test (scripts/compose_smoke.sh) must run on a docker host —
+# docker is not installed on the repo's build VM.
+
+services:
+  opa:
+    # PINNED: must match OPA_VERSION in src/gateway/opa_client.py
+    # (checksum-verified vendored binary in third_party/opa/).
+    image: openpolicyagent/opa:1.8.0
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "/policies"]
+    volumes:
+      # The versioned Rego bundle, read-only. Same directory the gateway
+      # serves to its sidecar fallback (default_policies_dir()).
+      - ./src/gateway/policies/v1:/policies:ro
+    networks:
+      - gw
+    # No healthcheck: the official image is scratch-based (no shell, curl,
+    # or wget). The gateway's OpaClient readiness probe (GATEWAY_OPA_URL
+    # mode) gates on OPA before serving decisions.
+
+  kev:
+    build:
+      context: .
+      dockerfile: docker/kev/Dockerfile
+    volumes:
+      # Weights (~1.8GB) live here after the first boot; dropped by
+      # `docker compose down -v`.
+      - kev-models:/models
+    environment:
+      KEV_DTYPE: bf16
+      HF_TOKEN: ${HF_TOKEN:-} # optional; both models are public
+    networks:
+      - gw
+    healthcheck:
+      # FastAPI serves /docs only after the checkpoint is loaded, so a
+      # 200 here means the model is ready for /v1/systemone.
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8009/docs -o /dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 300s # first boot downloads ~1.8GB of weights
+    # NOTE: kev-0.8b needs ~2GB RAM (1.7GB resident on CPU). Give the
+    # docker host headroom; see README.
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway/Dockerfile
+    depends_on:
+      opa:
+        condition: service_started
+      kev:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    environment:
+      # External OPA (no sidecar subprocess in the gateway container).
+      GATEWAY_OPA_URL: http://opa:8181
+      # Judge wired to the kev service; hooks stay OFF by default
+      # (GATEWAY_JUDGE_ENABLED=0) — opt-in, advisory-only.
+      GATEWAY_JUDGE_BACKEND: kev
+      GATEWAY_JUDGE_KEV_URL: http://kev:8009
+      # Demo seed (idempotent) + demo tools (demo.read allow /
+      # demo.write default-deny) for the one-command demo.
+      GATEWAY_SEED_DEMO: 1
+      GATEWAY_DEMO_TOOLS: 1
+      # Empty -> the entrypoint generates + persists a demo key (0600,
+      # first boot). Production MUST set this from the secret store.
+      GATEWAY_HMAC_KEY: ${GATEWAY_HMAC_KEY:-}
+    volumes:
+      - gateway-data:/data
+    networks:
+      - gw
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s # covers the OPA wait + demo seed on first boot
+    restart: unless-stopped
+
+volumes:
+  kev-models: # kev weights (~1.8GB); survives restarts, dropped by `down -v`
+  gateway-data: # config/audit/vault SQLite + demo credentials (0600)
+
+networks:
+  gw:
+    driver: bridge
