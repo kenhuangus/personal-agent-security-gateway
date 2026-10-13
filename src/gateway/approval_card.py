@@ -111,6 +111,13 @@ def detect_sponsor_signals(text: str) -> list[str]:
 # replay-complete for the execute-on-approval fallback (MF-11): the
 # server-side replay rebuilds the call args from this subset alone, so
 # what Ken sees on the card is exactly what executes (WYSIWYE).
+#
+# HASH-BINDING INVARIANT (issue #3): `content_hash` is computed over
+# EXACTLY the `replay_args` dict that will execute — the single source
+# of truth. The hash therefore binds the bytes that execute (and can
+# be recomputed at replay time), never bytes that never run.
+# Redaction applies to display previews (`body_preview`,
+# `*_preview`) ONLY — never to `replay_args`.
 # ---------------------------------------------------------------------
 
 def _audience_hash(parts: Any, ring: HmacKeyRing) -> str:
@@ -127,7 +134,8 @@ def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) ->
     Cleartext is LIMITED to recipient/payee, amount/currency, audience,
     and the rendered preview (with code-like secrets redacted). The
     ``replay_args`` entry carries the structured args the
-    execute-on-approval fallback replays server-side.
+    execute-on-approval fallback replays server-side, and
+    ``content_hash`` is computed over exactly that dict (issue #3).
     """
     args = args or {}
     if tool == "email.send":
@@ -137,7 +145,10 @@ def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) ->
         subject = str(args.get("subject") or "")
         body = str(args.get("body") or "")
         audience = {"to": to, "cc": cc, "bcc": bcc}
-        content = {"subject": subject, "body": body}
+        replay_args = {
+            "to": to, "cc": cc, "bcc": bcc,
+            "subject": subject, "body": body,
+        }
         return {
             "tool": tool,
             "audience": audience,
@@ -145,7 +156,7 @@ def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) ->
             "subject": subject,
             "body_preview": redact_code_like_secrets(body),
             "audience_hash": _audience_hash(audience, ring),
-            "content_hash": _content_hash(content, ring),
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {
                 "payee": to[0] if to else None,
                 "amount": None, "currency": None, "fees": None,
@@ -157,41 +168,43 @@ def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) ->
                 + (f" (+{len(cc)} cc, +{len(bcc)} bcc)" if cc or bcc else "")
                 + f". Subject: {subject[:80]!r}."
             ),
-            "replay_args": {
-                "to": to, "cc": cc, "bcc": bcc,
-                "subject": subject, "body": redact_code_like_secrets(body),
-            },
+            "replay_args": replay_args,
         }
     if tool == "email.settings.write":
         section = str(args.get("section") or "")
         settings_val = args.get("settings") or {}
         preview = redact_code_like_secrets(canonical_json(settings_val))
+        replay_args = {"section": section, "settings": settings_val}
         return {
             "tool": tool,
             "section": section,
             "settings_preview": preview,
-            "content_hash": _content_hash({"section": section, "settings": settings_val}, ring),
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {"payee": None, "amount": None, "currency": None, "fees": None,
                       "dates": None, "recurring": None, "cancellation": None,
                       "note": "recovery-affecting settings change (FR-PAA02-002/003)"},
             "consequence": f"Change mailbox settings section {section!r} (recovery-affecting).",
-            "replay_args": {"section": section, "settings": settings_val},
+            "replay_args": replay_args,
         }
     if tool == "calendar.delete":
         event_id = str(args.get("event_id") or "")
+        replay_args = {"event_id": event_id}
         return {
             "tool": tool,
             "event_id": event_id,
-            "content_hash": _content_hash({"event_id": event_id}, ring),
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {"payee": None, "amount": None, "currency": None, "fees": None,
                       "dates": None, "recurring": None, "cancellation": None,
                       "note": "destructive: no undo at the service"},
             "consequence": f"Delete calendar event {event_id!r} (destructive; no undo).",
-            "replay_args": {"event_id": event_id},
+            "replay_args": replay_args,
         }
     if tool == "calendar.create":
         attendees = list(args.get("attendees") or [])
         title = str(args.get("title") or "")
+        replay_args = {k: args.get(k) for k in
+                       ("title", "start", "end", "attendees", "description", "location", "calendar_id")
+                       if args.get(k) is not None}
         return {
             "tool": tool,
             "audience": {"attendees": attendees},
@@ -199,33 +212,30 @@ def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) ->
             "start": args.get("start"), "end": args.get("end"),
             "description_preview": redact_code_like_secrets(str(args.get("description") or "")),
             "audience_hash": _audience_hash({"attendees": attendees}, ring),
-            "content_hash": _content_hash(
-                {"title": title, "start": args.get("start"), "end": args.get("end")}, ring),
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {"payee": None, "amount": None, "currency": None, "fees": None,
                       "dates": {"start": args.get("start"), "end": args.get("end")},
                       "recurring": None, "cancellation": None, "note": None},
             "consequence": f"Create event {title!r} with {len(attendees)} attendee(s).",
-            "replay_args": {k: args.get(k) for k in
-                            ("title", "start", "end", "attendees", "description", "location", "calendar_id")
-                            if args.get(k) is not None},
+            "replay_args": replay_args,
         }
     if tool == "code.pr.open":
         body = str(args.get("body") or "")
+        replay_args = {k: args.get(k) for k in ("repo", "title", "head", "base")
+                       if args.get(k) is not None}
+        replay_args["body"] = body
         return {
             "tool": tool,
             "repo": args.get("repo"),
             "title": args.get("title"),
             "head": args.get("head"), "base": args.get("base"),
             "body_preview": redact_code_like_secrets(body),
-            "content_hash": _content_hash(
-                {"repo": args.get("repo"), "title": args.get("title"),
-                 "head": args.get("head"), "base": args.get("base"), "body": body}, ring),
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {"payee": args.get("repo"), "amount": None, "currency": None, "fees": None,
                       "dates": None, "recurring": None, "cancellation": None,
                       "note": "public write action on the code host"},
             "consequence": f"Open pull request {args.get('title')!r} on {args.get('repo')}.",
-            "replay_args": {k: args.get(k) for k in ("repo", "title", "head", "base")
-                            if args.get(k) is not None} | {"body": redact_code_like_secrets(body)},
+            "replay_args": replay_args,
         }
     # Generic fallback for any other sensitive tool: audience unknown,
     # content = redacted canonical args. Replay is NOT supported for

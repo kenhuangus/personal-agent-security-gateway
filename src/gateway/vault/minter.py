@@ -24,7 +24,10 @@ any upstream API within the connector's registered scopes until its
 The upstream exchange is behind the ``UpstreamTokenIssuer`` protocol.
 Tests use ``MockOAuthIssuer`` (W1's ``mock_oauth``); production
 wiring (real Google/Microsoft/GitHub token endpoints after Ken's OAuth
-app registrations) plugs in here without touching the pipeline.
+app registrations) implements ``issue(credential, agent_id, scopes,
+ttl)`` — the refresh-token exchange receives the vault credential
+through the protocol, so production plugs in without touching the
+pipeline.
 """
 
 from __future__ import annotations
@@ -44,12 +47,24 @@ from .store import VaultStore
 
 
 class UpstreamTokenIssuer(Protocol):
-    """Issues short-lived upstream access tokens from a stored credential."""
+    """Issues short-lived upstream access tokens from a stored credential.
+
+    The minter reads the connector's stored credential (refresh token /
+    API key) from the vault and hands it to ``issue`` — the issuer is
+    the ONLY component besides the vault read path that ever sees the
+    raw credential, which is what makes a production OAuth
+    ``refresh_token`` exchange possible (issue #2). The credential must
+    never be logged, placed in the issued-token ledger, or written to
+    an audit row.
+    """
 
     def issue(
-        self, agent_id: str, scopes: list[str], ttl_seconds: int
+        self, credential: str, agent_id: str, scopes: list[str], ttl_seconds: int
     ) -> tuple[str, float]:
-        """Return ``(token_value, expires_at_epoch)``."""
+        """Exchange ``credential`` for a short-lived upstream access token.
+
+        Return ``(token_value, expires_at_epoch)``.
+        """
         ...
 
     def validate(self, token_value: str) -> bool:
@@ -113,10 +128,13 @@ class VaultTokenMinter(TokenMinter):
             raise VaultError(
                 f"cannot derive token for {ctx.tool}: {exc}"
             ) from exc
-        # `_stored` (the refresh credential / API key) is used for the
-        # exchange inside the issuer and is never placed in the token.
+        # `_stored` (the refresh credential / API key) is handed to the
+        # issuer for the upstream exchange and is never placed in the
+        # token, the ledger, or any audit row (issue #2).
         ttl_seconds = self._settings.derived_token_minutes * 60
-        value, expires_at = self._issuer.issue(ctx.agent_id, [connector], ttl_seconds)
+        value, expires_at = self._issuer.issue(
+            _stored, ctx.agent_id, [connector], ttl_seconds
+        )
         now = time.time()
         self._ledger[_ledger_key(value)] = _IssuedToken(
             credential_id=credential_id,

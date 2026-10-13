@@ -448,6 +448,16 @@ class TestVaultTokenMinter:
         # repr never leaks the material (FR-022)
         assert tok.raw() not in repr(tok)
 
+    def test_issuer_receives_the_stored_credential(
+        self, minter, issuer, credential_bundle
+    ):
+        # Issue #2: the minter forwards the vault's stored credential to
+        # the issuer so a production OAuth refresh_token exchange can
+        # receive it. The derived token is NOT the credential.
+        minter.mint(self._ctx())
+        assert issuer.last_credential == credential_bundle["secrets"]["email"]
+        assert issuer.last_credential is not None
+
     def test_unknown_connector_fails_closed(self, minter):
         with pytest.raises(VaultError, match="no active vault credential"):
             minter.mint(self._ctx(tool="notes.write"))

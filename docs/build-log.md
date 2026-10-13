@@ -1993,3 +1993,121 @@ AC-11 budget; the instrumentation itself does not touch the budget.
   runtime, `repr=False` in Settings); no code copied from other repos
   (adapter written from the OpenAI chat-completions contract).
 
+
+## Batch 1 — High-severity production-readiness fixes (#2–#6) (2026-10-13, fix worker)
+
+Branch `fix/highs` from main@85880cf. All five HIGH issues from the
+2026-10-13 production-readiness review fixed; PR workflow (no merge
+without Ken). Full suite green: **623 passed, 8 skipped** (615
+pre-existing + 8 new tests).
+
+### #2 — UpstreamTokenIssuer now receives the vault credential
+- `src/gateway/vault/minter.py`: protocol extended to
+  `issue(credential, agent_id, scopes, ttl_seconds)`; `mint()` forwards
+  the vault-read `_stored` credential (refresh token / API key) as the
+  first argument. The old docstring claim ("`_stored` is used for the
+  exchange inside the issuer") is now actually true in code; the
+  module docstring's production-wiring paragraph updated to name the
+  new signature.
+- `src/gateway/vault/mock_oauth_issuer.py`: mock accepts the
+  credential and records it as `last_credential` (in-memory test seam
+  only — never logged/persisted) so tests prove the plumbing.
+- Credential hygiene verified: the issued-token ledger keys by
+  sha256(token) and stores only `credential_id`; the `token-mint`
+  audit row carries `credential_id` + bound scope only; the
+  `VaultError` path names the connector, never the secret
+  (`store.read` errors are secret-free).
+- New test: `test_issuer_receives_the_stored_credential`.
+
+### #3 — content_hash binds the bytes that execute
+- `src/gateway/approval_card.py`: every tool builder now constructs
+  `replay_args` FIRST and computes `content_hash` over exactly that
+  dict (single source of truth). `email.send` and `code.pr.open`
+  replay the RAW body (redaction was silently mangling invoice
+  numbers / order IDs / dates like `20261013` into `[redacted:code]`
+  in executed emails); redaction now applies to `body_preview`
+  (display) only. `calendar.create`'s hash now covers the full
+  replay dict (previously a 3-field subset). Hash-binding invariant
+  documented in the module header + `build_evidence_subset` docstring.
+- New tests: `TestContentHashBindsReplayArgs` (3 tests: hash ==
+  hash(replay_args); digits intact in replay; preview still redacted).
+
+### #4 — Account-level admin lockout independent of client IP
+- `src/gateway/console/admin_auth.py`: `_on_failure` now locks the
+  ACCOUNT for 30 minutes after 15 total consecutive failures across
+  ALL source IPs (`_ACCOUNT_FAILURES_BEFORE_LOCKOUT = 15`,
+  `_ACCOUNT_LOCKOUT_MINUTES = 30`), kept alongside the per-IP guard
+  (the longer of the two wins; extensions never shorten a live
+  lockout). Counter resets only on successful login (existing
+  behavior preserved).
+- LATENT CRASH FIXED on the same path: `login()` compared aware
+  `_utcnow()` against `user.locked_until`, but SQLite returns the
+  `DateTime(timezone=True)` column NAIVE → `TypeError` → 500 on any
+  request that reached the persisted-lockout check from a fresh IP or
+  after restart (the per-IP guard had been masking it in tests). Now
+  normalized with `as_utc()` per the M1 convention. Without this fix
+  the new account lockout would 500 instead of denying.
+- Module docstring updated. New tests:
+  `test_account_lockout_after_15_failures_across_ips`,
+  `test_successful_login_resets_account_failure_counter`.
+- FLAG FOR KEN: threshold (15) and duration (30 min) are judgment
+  calls — say the word to change either; account lockout is fixed
+  duration, no escalation (per-IP guard keeps its 1/2/4…60 schedule).
+
+### #5 — Secure flag on the admin session cookie
+- `src/gateway/config.py`: new `console_cookie_secure: bool` setting
+  (`GATEWAY_CONSOLE_COOKIE_SECURE`, default true) + `_env_bool`
+  helper; `src/gateway/console/admin_auth.py::set_session_cookie`
+  passes `secure=self.settings.console_cookie_secure`.
+- Tests: `test_session_cookie_secure_flag_defaults_on` (true default),
+  `test_session_cookie_secure_flag_opt_out`. The console integration
+  `settings` fixture sets `GATEWAY_CONSOLE_COOKIE_SECURE=0`: the
+  TestClient speaks plain HTTP and a Secure cookie is (correctly)
+  never sent back over HTTP — the documented local-dev opt-out.
+- FLAG FOR KEN: default true is the safe choice, but any plain-HTTP
+  deploy (including local dev) needs the env var set to 0 or logins
+  will silently fail to persist.
+
+### #6 — kev image: digest pins, no unpickle, non-root
+- `docker/kev/artifact-digests.env` (NEW): single source of truth for
+  all five SHA-256 pins, with provenance comments. Digests:
+  adapter `72813c8d…975e62`, base model `9c17d06a…3b9928e5b`
+  (sha256sum of the local serving copies — byte-identical to HF,
+  sizes match the old size checks); head.pt `f400bd12…2c920b6`
+  (PRISTINE copy freshly re-downloaded — the local serving copy is
+  patched and must NOT be pinned); torch wheel `cb9a8ba8…8160db4e`
+  (official PyTorch PEP 503 simple-index hash fragment);
+  kev tarball `16cc5f2e…2005c3f48` (GitHub codeload tarball for the
+  pinned commit).
+- `docker/kev/entrypoint.sh`: sources the manifest (fail-closed when
+  missing); `verify_artifact` checks size AND SHA-256, aborting boot
+  on mismatch. Adapter + base re-verified every boot (never
+  modified); head.pt verified AT DOWNLOAD TIME against the pristine
+  pin — the patch step rewrites it (meta.base), so it cannot match
+  the pristine digest on later boots by design (documented in-file;
+  a corrupt head.pt still fails closed via torch.load under
+  `set -e`). `torch.load(..., weights_only=True)` — verified safe:
+  the pristine checkpoint loads as a plain dict of safe types under
+  weights_only (checked with the local torch 2.8.0+cpu).
+- `docker/kev/Dockerfile`: torch wheel and kev tarball downloads now
+  `sha256sum -c` against the manifest before install (build aborts on
+  mismatch); non-root `kevuser` (mirrors the gateway image's
+  appuser), `/models` chown'd so fresh named volumes inherit
+  ownership, `USER kevuser` before ENTRYPOINT.
+- NOT EXECUTED: no docker host on this VM — Dockerfiles reviewed,
+  not built (stated in the PR). Entrypoint syntax-checked
+  (`bash -n`) and the `verify_artifact` logic dry-run against the
+  real local files (all three pristine artifacts verify; the patched
+  head.pt is correctly rejected by the pristine pin, proving the
+  download-time-only ordering).
+
+### Invariants verified (no regressions)
+- Fix A (auth wall), Fix B (approval flow + stage order), Rego
+  decision contract, fail-closed paths, judge advisory-only: full
+  suite green, no changes to `policy.py`, `pipeline.py` stage order,
+  `policies/v1/`, or judge code.
+- No secrets/API keys in repo or tests (digests are integrity pins,
+  not secrets; test credentials generated at test time).
+- No model weights committed (only SHA-256 digests).
+- Stealth wording untouched (no OWASP-text edits anywhere).
+- `.github/` untouched.

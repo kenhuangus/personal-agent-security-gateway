@@ -5,11 +5,14 @@
   /setup, which creates the admin (password + TOTP secret with QR
   provisioning). /setup disappears once an admin exists.
 - Login is rate-limited with lockout and exponential backoff
-  (FR-040): 5 consecutive failures trigger a lockout whose duration
-  doubles per lockout (1, 2, 4, … minutes, capped at 60). Lockout
-  state is persisted on AdminUser (failed_logins, locked_until) so a
-  restart does not clear it; per-IP backoff is additionally kept
-  in-process by LoginGuard.
+  (FR-040): 5 consecutive failures from one IP trigger a per-IP
+  lockout whose duration doubles per lockout (1, 2, 4, … minutes,
+  capped at 60). INDEPENDENTLY, 15 total consecutive failures from
+  ANY source IPs lock the ACCOUNT for 30 minutes, so rotating IPs
+  cannot buy unlimited guesses (issue #4). Lockout state is persisted
+  on AdminUser (failed_logins, locked_until) so a restart does not
+  clear it; per-IP backoff is additionally kept in-process by
+  LoginGuard. Both counters reset on successful login.
 - EVERY login attempt — success or failure — emits an audit event
   (FR-039): agent_id="admin", tool="admin.login",
   decision="allowed"/"denied", reason="ok" | "invalid_password" |
@@ -39,7 +42,7 @@ import qrcode
 
 from ..audit import AuditLog
 from ..config import Settings
-from ..models import AdminUser
+from ..models import AdminUser, as_utc
 
 SESSION_COOKIE = "gw_admin"
 ADMIN_ID = "admin_ken"  # single admin = Ken (02 §3.3); admin_id seam kept
@@ -47,6 +50,11 @@ ADMIN_ID = "admin_ken"  # single admin = Ken (02 §3.3); admin_id seam kept
 _LOCKOUT_BASE_MINUTES = 1
 _LOCKOUT_CAP_MINUTES = 60
 _FAILURES_BEFORE_LOCKOUT = 5
+# Account-level lockout (issue #4): total consecutive failures across
+# ALL source IPs before the account itself locks. Sane default 15;
+# flag for Ken if he wants a different threshold or duration.
+_ACCOUNT_FAILURES_BEFORE_LOCKOUT = 15
+_ACCOUNT_LOCKOUT_MINUTES = 30
 
 
 def _utcnow() -> dt.datetime:
@@ -224,11 +232,15 @@ class AdminAuth:
         return self._unsign(cookie_value)
 
     def set_session_cookie(self, response: Any, token: str) -> None:
+        # Issue #5: Secure flag on the admin session cookie, governed by
+        # the console_cookie_secure setting (default true; disable only
+        # for local HTTP development).
         response.set_cookie(
             SESSION_COOKIE,
             token,
             samesite="strict",
             httponly=True,
+            secure=self.settings.console_cookie_secure,
             path="/",
         )
 
@@ -258,7 +270,11 @@ class AdminAuth:
         if user is None:
             self._audit_login("denied", "no_such_admin", client_ip)
             return False, "no_such_admin"
-        if user.locked_until is not None and _utcnow() < user.locked_until:
+        # as_utc: SQLite returns naive datetimes for the
+        # DateTime(timezone=True) column; without normalization this
+        # comparison raises TypeError (issue #4 — the account-lockout
+        # path reaches it from any IP).
+        if user.locked_until is not None and _utcnow() < as_utc(user.locked_until):
             self.guard.record_failure(client_ip)
             self._audit_login("denied", "locked_out", client_ip)
             return False, "locked_out"
@@ -276,10 +292,29 @@ class AdminAuth:
         return True, "ok"
 
     def _on_failure(self, db: Any, user: AdminUser, client_ip: str, reason: str) -> None:
-        lockout = self.guard.record_failure(client_ip)
+        ip_lockout = self.guard.record_failure(client_ip)
         user.failed_logins = (user.failed_logins or 0) + 1
-        if lockout is not None:
-            user.locked_until = _utcnow() + lockout
+        lock_until: Optional[dt.datetime] = None
+        if ip_lockout is not None:
+            lock_until = _utcnow() + ip_lockout
+        if user.failed_logins >= _ACCOUNT_FAILURES_BEFORE_LOCKOUT:
+            # Account-level lockout (issue #4): N total consecutive
+            # failures regardless of source IP — IP rotation cannot
+            # evade this. Kept alongside (not instead of) the per-IP
+            # guard; the longer of the two wins.
+            account_until = _utcnow() + dt.timedelta(
+                minutes=_ACCOUNT_LOCKOUT_MINUTES
+            )
+            lock_until = (
+                account_until
+                if lock_until is None
+                else max(lock_until, account_until)
+            )
+        if lock_until is not None:
+            # Extend only — never shorten a live lockout.
+            current = as_utc(user.locked_until)
+            if current is None or lock_until > current:
+                user.locked_until = lock_until
         db.commit()
         self._audit_login("denied", reason, client_ip)
 

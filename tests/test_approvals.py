@@ -41,7 +41,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from gateway.approval_card import build_card, render_inert_html
+from gateway.approval_card import build_card, build_evidence_subset, render_inert_html
 from gateway.approvals import (
     DESTRUCTIVE_TOOLS,
     ApprovalService,
@@ -778,6 +778,58 @@ class TestEvidenceSubset:
         redacted = redact_full_args({"body": "code 123456", "to": ["a@b.c"]})
         assert "123456" not in json.dumps(redacted)
         assert redacted["to"] == ["a@b.c"]
+
+
+# ---------------------------------------------------------------------------
+# content_hash binds the bytes that execute (issue #3)
+# ---------------------------------------------------------------------------
+
+
+class TestContentHashBindsReplayArgs:
+    def test_email_send_hash_covers_exact_replay_args(self, ring):
+        body = "Invoice 20261013 for order 482916 is due."
+        ev = build_evidence_subset(
+            "email.send",
+            {"to": ["a@b.c"], "subject": "s", "body": body},
+            ring,
+        )
+        # Single source of truth: the hash binds replay_args exactly,
+        # so it can be recomputed at replay time.
+        from gateway.approval_card import _content_hash
+
+        assert ev["content_hash"] == _content_hash(ev["replay_args"], ring)
+        # What executes is the RAW body — digits intact, never mangled
+        # by the display redactor.
+        assert ev["replay_args"]["body"] == body
+        assert "20261013" in ev["replay_args"]["body"]
+        assert "482916" in ev["replay_args"]["body"]
+        # Redaction stays in the display preview only.
+        assert "482916" not in ev["body_preview"]
+        assert "[redacted:code]" in ev["body_preview"]
+
+    def test_code_pr_open_hash_covers_exact_replay_args(self, ring):
+        body = "Fixes ticket 12345678."
+        ev = build_evidence_subset(
+            "code.pr.open",
+            {"repo": "o/r", "title": "t", "head": "h", "base": "b",
+             "body": body},
+            ring,
+        )
+        from gateway.approval_card import _content_hash
+
+        assert ev["content_hash"] == _content_hash(ev["replay_args"], ring)
+        assert ev["replay_args"]["body"] == body
+        assert "12345678" not in ev["body_preview"]
+
+    def test_calendar_create_hash_covers_full_replay_args(self, ring):
+        args = {"title": "t", "start": "s", "end": "e",
+                "attendees": ["a@b.c"], "description": "d",
+                "location": "l"}
+        ev = build_evidence_subset("calendar.create", args, ring)
+        from gateway.approval_card import _content_hash
+
+        assert ev["content_hash"] == _content_hash(ev["replay_args"], ring)
+        assert ev["replay_args"]["location"] == "l"
 
 
 # ---------------------------------------------------------------------------

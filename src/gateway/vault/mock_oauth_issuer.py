@@ -23,10 +23,17 @@ class MockOAuthIssuer:
 
     def __init__(self, provider: Optional[MockOAuthProvider] = None) -> None:
         self.provider = provider or MockOAuthProvider()
+        # Test seam (issue #2): the credential the minter forwarded on
+        # the last issue() call. The mock mints fake tokens and needs
+        # no credential to do so, but recording it proves the plumbing
+        # forwards the vault's stored credential. In-memory only —
+        # never logged or persisted.
+        self.last_credential: Optional[str] = None
 
     def issue(
-        self, agent_id: str, scopes: list[str], ttl_seconds: int
+        self, credential: str, agent_id: str, scopes: list[str], ttl_seconds: int
     ) -> tuple[str, float]:
+        self.last_credential = credential
         tok = self.provider.issue_token(agent_id, scopes)
         expires_at = time.time() + ttl_seconds
         # Pin the mock record to the requested TTL (the mock's own
