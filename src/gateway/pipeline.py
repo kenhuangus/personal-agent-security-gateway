@@ -177,6 +177,17 @@ class CallContext:
     # Free-form notes from output inspection (e.g. the leakage report's
     # flagged/unlabeled counts); observability only.
     inspection_notes: dict[str, Any] = field(default_factory=dict)
+    # Judge advisory state (gateway.judge; default OFF).
+    # judge_risk: the RiskScore when the intent risk scorer stepped an
+    # allowed call up to approval (allow→ask); rides to the approval
+    # record/card via judge_risk_for_approval_record(). Never set on
+    # deny/require_approval paths.
+    judge_risk: Optional[Any] = None
+    # judge_counterparty_signals: advisory urgency/impersonation
+    # signals for the approval record's counterparty evidence
+    # (judge_signals_for_approval_record()); deterministic flags and
+    # the escalator are unchanged.
+    judge_counterparty_signals: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -745,6 +756,39 @@ class PipelineOutcome:
         return self.error is None
 
 
+def _judge_wiring(
+    settings: Settings, judge_cascade: Optional[Any]
+) -> tuple[Optional[Any], Optional[Any]]:
+    """Build the judge hooks for the pipeline builders.
+
+    Returns ``(inspection_hook, risk_scorer)`` — both None unless
+    ``GATEWAY_JUDGE_ENABLED=1``. When enabled without an explicit
+    cascade, the cascade is built from settings
+    (``GATEWAY_JUDGE_BACKEND``; ``"none"`` → DisabledBackend →
+    JudgeUnavailable → deterministic fallback everywhere). Imports are
+    lazy: the judge package is untouched when the hooks are off.
+    """
+    if not getattr(settings, "judge_enabled", False):
+        return None, None
+    from .judge.cascade import JudgeCascade
+    from .judge.factory import backend_from_settings
+    from .judge.inspection_hook import JudgeInspectionHook
+    from .judge.risk import build_risk_scorer
+
+    cascade = judge_cascade
+    if cascade is None:
+        cascade = JudgeCascade(
+            primary=backend_from_settings(settings),
+            escalation=None,
+            threshold=0.75,
+            timeout_s=getattr(settings, "judge_timeout_s", 2.0),
+        )
+    hook = JudgeInspectionHook(
+        cascade, always_on=getattr(settings, "judge_always_on", False)
+    )
+    return hook, build_risk_scorer(settings, cascade)
+
+
 def build_m1_pipeline(
     config_db: Session,
     audit_db: Session,
@@ -752,6 +796,7 @@ def build_m1_pipeline(
     hmac_ring: Optional[HmacKeyRing] = None,
     registry: Optional[ConnectorRegistry] = None,
     minter: Optional["TokenMinter"] = None,
+    judge_cascade: Optional[Any] = None,
 ) -> tuple[Pipeline, ConnectorRegistry, AuthenticateStage]:
     """Assemble the M1 pipeline: auth + mandate + audit wired; every
     other stage is a documented stub naming its owning milestone —
@@ -764,6 +809,9 @@ def build_m1_pipeline(
     registry, so W2's registrations are visible to every call).
     *minter* replaces the ``StubTokenMinter`` (W3/M4 seam): pass the
     vault-backed ``VaultTokenMinter`` to wire the real layer-2 mint.
+    *judge_cascade*: an optional ``gateway.judge.JudgeCascade``; the
+    advisory inspection hook is installed only when
+    ``GATEWAY_JUDGE_ENABLED=1`` (default off).
     """
     settings = settings or Settings()
     registry = registry if registry is not None else ConnectorRegistry()
@@ -774,6 +822,8 @@ def build_m1_pipeline(
     catalog = RedactionCatalog(config_db)
     rate_limiter = RateLimiter(config_db, settings)
     inspection_config = InspectionConfig()
+    # Judge hooks (advisory; default off — see _judge_wiring).
+    judge_hook, _ = _judge_wiring(settings, judge_cascade)
 
     auth_stage = AuthenticateStage(identity)
     audit_stage = AuditStage(audit)
@@ -791,7 +841,8 @@ def build_m1_pipeline(
         # passed via the *minter* parameter (VaultTokenMinter).
         TokenMintStage(minter if minter is not None else StubTokenMinter()),
         ExecuteStage(registry),  # W2: connector handlers
-        InspectOutputStage(audit=audit, catalog=catalog, config=inspection_config),
+        InspectOutputStage(audit=audit, catalog=catalog, config=inspection_config,
+                           judge=judge_hook),
         # AuditStage is terminal: passed separately, runs exactly once.
     ]
     pipeline = Pipeline(
@@ -813,12 +864,16 @@ def build_pipeline(
     approval_service: Any = None,
     approvals: bool = False,
     minter: Optional["TokenMinter"] = None,
+    judge_cascade: Optional[Any] = None,
 ) -> tuple[Pipeline, ConnectorRegistry, AuthenticateStage]:
     """Assemble the M2/M3 pipeline: hardened validator + REAL policy engine.
 
     Same Fix-B stage order as build_m1_pipeline; the only differences
     are (1) ``policy.PolicyStage`` replaces the default-deny stub, and
     (2) ``ValidateInputsStage`` now runs the M5 hardened validator.
+    *judge_cascade*: an optional ``gateway.judge.JudgeCascade``; the
+    advisory inspection hook and intent risk step-up are installed only
+    when ``GATEWAY_JUDGE_ENABLED=1`` (default off).
     W2 registers connector tools; W3 replaces the token minter.
 
     ``grant_checker`` is the M3 grant-store seam (Fix B, MF-7); None in
@@ -846,6 +901,8 @@ def build_pipeline(
     catalog = RedactionCatalog(config_db)
     rate_limiter = RateLimiter(config_db, settings)
     inspection_config = InspectionConfig()
+    # Judge hooks (advisory; default off — see _judge_wiring).
+    judge_hook, risk_scorer = _judge_wiring(settings, judge_cascade)
 
     # -- M3 approval wiring -------------------------------------------------
     # Lazy: approvals.py is imported by pipeline clients in orders that
@@ -892,11 +949,13 @@ def build_pipeline(
             defer_approval=defer_approval,
             sensitivity_escalator=escalator,
             unknown_outcome_gate=unknown_gate,
+            risk_scorer=risk_scorer,
         ),
         _ApprovalStage(approval_stage_service),
         TokenMintStage(minter if minter is not None else StubTokenMinter()),
         ExecuteStage(registry, unknown_outcome=unknown_gate),
-        InspectOutputStage(audit=audit, catalog=catalog, config=inspection_config),
+        InspectOutputStage(audit=audit, catalog=catalog, config=inspection_config,
+                           judge=judge_hook),
     ]
     pipeline = Pipeline(
         stages, audit_stage, settings, hmac_ring,

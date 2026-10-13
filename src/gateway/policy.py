@@ -71,6 +71,7 @@ from sqlalchemy.orm import Session
 
 from .errors import make_error, policy_denied
 from .intent import Intent, intent_from_parts, normalize_intent
+from .judge.risk import apply_risk_step_up
 from .models import Agent, Mandate, PolicyRule, PolicyVersion
 from .ontology import integration as _ontology
 from .ontology.models import (
@@ -1495,6 +1496,12 @@ class PolicyStage:
     passes through so the ApprovalStage (step 5) runs the 02 §2.8
     step-3 lookup chain and creates the ``apr_`` request. The decision
     vocabulary is unchanged.
+
+    JUDGE risk advisor (``risk_scorer``; default None = off): an
+    optional ``(intent, ctx) -> RiskScore | None`` consulted AFTER the
+    policy decision, on allowed calls only. A "high" rating steps the
+    call up to approval (allow→ask). It can never turn a deny into an
+    allow and never runs in front of policy evaluation.
     """
 
     name = "policy"
@@ -1507,6 +1514,7 @@ class PolicyStage:
         defer_approval: bool = False,
         sensitivity_escalator: Optional[Callable[[str, str, dict], Optional[str]]] = None,
         unknown_outcome_gate: Any = None,
+        risk_scorer: Optional[Callable[[Any, Any], Any]] = None,
     ):
         self.engine = PolicyEngine(
             db, grant_checker=grant_checker, hmac_ring=hmac_ring,
@@ -1515,6 +1523,7 @@ class PolicyStage:
         self.hmac_ring = hmac_ring
         self.defer_approval = defer_approval
         self.unknown_outcome_gate = unknown_outcome_gate
+        self.risk_scorer = risk_scorer
 
     def run(self, ctx: Any) -> Any:  # CallContext; typed loosely to avoid a cycle
         # FR-PAA06-003: an unresolved unknown-outcome block stops the
@@ -1596,6 +1605,32 @@ class PolicyStage:
         if result.via_grant:
             ctx.via_grant = True
             ctx.approval_request_id = result.approval_request_id
+        # Judge risk advisor (advisory; allow→ask only). Consulted
+        # AFTER the policy decision — never in front of it — and can
+        # only ADD friction: a "high" rating on an allowed call steps
+        # up to approval. Deny / require_approval / grant paths are
+        # untouched, and the advisor can never turn a deny into an
+        # allow. Default off (risk_scorer=None): behavior identical.
+        if self.risk_scorer is not None and not result.via_grant:
+            with timing_span(ctx, "policy.judge_risk"):
+                try:
+                    risk = self.risk_scorer(intent, ctx)
+                except Exception:  # noqa: BLE001 — advisory: never break the policy path
+                    risk = None
+            if risk is not None and apply_risk_step_up(ctx, result.decision, risk):
+                # Stepped up: allow → ask. With deferral the
+                # ApprovalStage (step 5) creates the apr_ request; in
+                # M2 mode the call halts with approval_required, exactly
+                # like a policy require_approval.
+                ctx.escalation_reason = ctx.escalation_reason or "judge_high_risk"
+                if self.defer_approval:
+                    return None
+                return make_error(
+                    "approval_required",
+                    f"{ctx.tool}: sensitive action requires step-up approval",
+                    ctx.request_id,
+                    {"tool": ctx.tool, "judge_step_up": True},
+                )
         ctx.scope_rule = result.scope_rule
         return None
 

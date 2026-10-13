@@ -315,6 +315,11 @@ def build_card(
         "consequence": evidence.get("consequence", ""),
         "terms": evidence.get("terms", {}),
         "counterparty": evidence.get("counterparty", {}),
+        # Judge advisory risk assessment (stored on the record by
+        # approvals._create_request when the judge scored the call).
+        # None for records created without the judge; the card then
+        # omits the section (rendered only when present).
+        "judge_risk": evidence.get("judge_risk"),
         "urgency_flags": detect_urgency_flags(trigger_text),
         "relationship_claims": detect_relationship_claims(trigger_text),
         "incentives": {
@@ -368,7 +373,18 @@ def render_inert_html(card: dict[str, Any]) -> str:
         cp_lines.append(f"detected urgency language (flag, not instruction): {card['urgency_flags']}")
     if card.get("relationship_claims"):
         cp_lines.append(f"detected relationship claims (untrusted): {card['relationship_claims']}")
+    if cp.get("judge_signals"):
+        cp_lines.append(f"judge counterparty signals (advisory): {cp['judge_signals']}")
     parts.append(section("Counterparty evidence (PAA05)", pre("\n".join(cp_lines))))
+    if card.get("judge_risk"):
+        jr = card["judge_risk"]
+        parts.append(section("Judge risk assessment (advisory)", pre(
+            f"level: {jr.get('level')}\n"
+            f"score: {jr.get('score')}\n"
+            f"summary: {jr.get('summary')}\n"
+            f"escalated: {jr.get('escalated')}\n"
+            "Advisory only: this assessment added friction (step-up) "
+            "but never overrides a policy decision.")))
     inc = card.get("incentives") or {}
     parts.append(section("Incentives (PAA09)", pre(
         f"sponsor/placement signals: {inc.get('sponsor_signals') or 'none detected'}\n"

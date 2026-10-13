@@ -56,6 +56,8 @@ from .counterparty import CounterpartyService
 from .errors import GatewayError, ToolHalt, invalid_input, make_error
 from .hmac_util import HmacKeyRing
 from .ids import is_valid_id, new_approval_id
+from .judge.counterparty_hook import judge_signals_for_approval_record
+from .judge.risk import judge_risk_for_approval_record
 from .mandates import MandateService
 from .models import (
     ApprovalRequest,
@@ -540,6 +542,17 @@ class ApprovalService:
             # MVP — stated, never invented (FR-PAA05-005).
             "claim_source": "not provided in MVP",
         }
+        # Judge advisory signals (additive; mirrors the
+        # urgency_flags_for_approval_record() pattern): the risk
+        # assessment and counterparty signals ride on the record so
+        # the card can render them. Stored only when the judge scored
+        # this call; the deterministic evidence is untouched.
+        judge_risk = judge_risk_for_approval_record(ctx)
+        if judge_risk is not None:
+            evidence["judge_risk"] = judge_risk
+        judge_cp_signals = judge_signals_for_approval_record(ctx)
+        if judge_cp_signals is not None:
+            evidence["counterparty"]["judge_signals"] = judge_cp_signals
         if ctx.mandate is None:
             raise RuntimeError("approval requested without a live mandate (unreachable)")
         apr = ApprovalRequest(

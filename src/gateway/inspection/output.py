@@ -62,6 +62,16 @@ class InspectOutputStage:
     All are optional for unit-test construction — the stage fails
     closed (deny) rather than passing output through uninspected when a
     dependency is missing or raises.
+
+    ``judge`` is an optional ``gateway.judge.JudgeInspectionHook``
+    (default None = hook not installed). When installed it fires only
+    after the deterministic injection scan flagged suspicion, or on
+    every output when the hook's ``always_on`` is set
+    (``GATEWAY_JUDGE_ALWAYS_ON=1``). A high-confidence judge "yes"
+    reuses the EXISTING ``injected_output_blocked`` halt; any other
+    outcome (no / unsure / unavailable) leaves the deterministic
+    verdict untouched — the hook can only add friction, never remove
+    it.
     """
 
     name = "inspect_output"
@@ -71,10 +81,12 @@ class InspectOutputStage:
         audit: Any = None,
         catalog: Optional[RedactionCatalog] = None,
         config: Optional[InspectionConfig] = None,
+        judge: Optional[Any] = None,
     ) -> None:
         self.audit = audit
         self.catalog = catalog if catalog is not None else RedactionCatalog()
         self.config = config if config is not None else InspectionConfig()
+        self.judge = judge
 
     def run(self, ctx: Any) -> Optional[_errors.GatewayError]:
         from ..pipeline import timing_span  # lazy: pipeline imports this module
@@ -109,6 +121,22 @@ class InspectOutputStage:
             # "redact": strip the matched spans, keep the call alive.
             with timing_span(ctx, "inspect.injection_redact"):
                 ctx.result = injection_scan.redact_findings(ctx.result, scan)
+
+        # -- 1b. judge manipulation scan (advisory; friction-additive) --
+        # Pre-filter gate: fires only when the deterministic scanner
+        # flagged suspicion, or on every output when the hook's
+        # always_on is set (GATEWAY_JUDGE_ALWAYS_ON=1). A
+        # high-confidence judge "yes" reuses the EXISTING
+        # injected_output_blocked halt (no new deny code); no / unsure /
+        # unavailable leaves the deterministic verdict untouched.
+        # Note: a deterministic block above already returned, so this
+        # gate can only escalate a "redact" outcome or an always_on
+        # pass — never clear a deterministic finding.
+        if self.judge is not None and (scan.hit or self.judge.always_on):
+            with timing_span(ctx, "inspect.judge"):
+                judge_error = self.judge.check(ctx, ctx.result)
+            if judge_error is not None:
+                return judge_error
 
         # -- 2. PII / code-artifact redaction (FR-027, FR-PAA02-001) ------
         with timing_span(ctx, "inspect.redaction"):

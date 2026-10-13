@@ -10,3 +10,16 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Local judge-model serving (JUDGE live tier): model weights, HF caches, and
+# the upstream kev checkout must never be committed. The kev repo lives at
+# ~/workspace/kev-upstream/ (OUTSIDE this repo); weights live in the HF cache.
+*.safetensors
+*.bin
+*.pt
+*.onnx
+*.gguf
+.hf_cache/
+.huggingface/
+runs/
+checkpoints/

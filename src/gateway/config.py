@@ -124,6 +124,41 @@ class Settings:
     # 00 §7 param 15: UTC in storage, Ken's local timezone in display.
     display_tz: str = field(default_factory=lambda: _env("GATEWAY_DISPLAY_TZ", "America/New_York"))
 
+    # --- judge decision backends (JUDGE build; OPT-IN) ---
+    # "none" (default) = DisabledBackend: no judge calls, AC-11 latency
+    # budget untouched. "kev" = local Kev-4B /v1/systemone server (or
+    # OpenRouter via KEV_API_KEY). "jev" = TypeSafe hosted Jev API.
+    judge_backend: str = field(default_factory=lambda: _env("GATEWAY_JUDGE_BACKEND", "none"))
+    judge_kev_url: str = field(
+        default_factory=lambda: _env("GATEWAY_JUDGE_KEV_URL", "http://127.0.0.1:8009")
+    )
+    judge_jev_url: str = field(default_factory=lambda: _env("GATEWAY_JUDGE_JEV_URL", ""))
+    judge_jev_api_key: str = field(
+        default_factory=lambda: _env("GATEWAY_JUDGE_JEV_API_KEY", ""), repr=False
+    )
+    # Per-decide timeout (seconds); consumed at the decide() call site,
+    # not by the factory — the cascade passes settings.judge_timeout_s.
+    judge_timeout_s: float = field(
+        default_factory=lambda: float(_env("GATEWAY_JUDGE_TIMEOUT_S", "2.0"))
+    )
+    # --- judge pipeline hooks (advisory; default OFF) ---
+    # GATEWAY_JUDGE_ENABLED=1 lets the pipeline INSTALL the judge hooks
+    # (inspection second-opinion, intent risk step-up, counterparty
+    # signals). Default 0: the deterministic path is byte-identical.
+    # (Separate from GATEWAY_JUDGE_BACKEND: enabling the hooks with the
+    # "none" backend just yields JudgeUnavailable → deterministic
+    # fallback everywhere.)
+    judge_enabled: bool = field(
+        default_factory=lambda: bool(_env_int("GATEWAY_JUDGE_ENABLED", 0))
+    )
+    # When the hooks are enabled, the inspection hook fires only when
+    # the deterministic scanner already flagged suspicion (pre-filter
+    # gate). GATEWAY_JUDGE_ALWAYS_ON=1 consults the judge on every
+    # tool output instead. Default 0.
+    judge_always_on: bool = field(
+        default_factory=lambda: bool(_env_int("GATEWAY_JUDGE_ALWAYS_ON", 0))
+    )
+
     def validate(self) -> list[str]:
         """Return a list of config problems. Empty = OK."""
         problems: list[str] = []
@@ -138,6 +173,13 @@ class Settings:
             problems.append("GATEWAY_DERIVED_TTL_MIN must be > 0")
         if self.approval_queue_cap <= 0:
             problems.append("GATEWAY_APPROVAL_CAP must be > 0")
+        if self.judge_backend.strip().lower() not in ("none", "kev", "jev"):
+            problems.append(
+                f"GATEWAY_JUDGE_BACKEND={self.judge_backend!r} is not one of "
+                "none|kev|jev"
+            )
+        if self.judge_timeout_s <= 0:
+            problems.append("GATEWAY_JUDGE_TIMEOUT_S must be > 0")
         return problems
 
 
