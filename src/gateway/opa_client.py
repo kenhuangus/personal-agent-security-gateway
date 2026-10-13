@@ -5,6 +5,13 @@ decision client. The sidecar is STATELESS: every input document carries
 the rules, the intent, and the ontology snapshot, so a restart loses
 nothing and no per-version data sync is needed.
 
+Two modes:
+- Sidecar (default): launches and supervises ``opa run --server`` as a
+  child process (UDS transport default, TCP fallback).
+- External (``GATEWAY_OPA_URL`` set, e.g. ``http://opa:8181``): no
+  subprocess is launched; decisions go to the given OPA server over
+  HTTP. This is how deployments run OPA (separate container/service).
+
 Transports: TCP keep-alive (127.0.0.1) or Unix-domain socket. The UDS
 transport is the default: the spike measured ~2.3 ms of the sidecar
 p50 in OPA's HTTP layer, and the UDS path avoids TCP loopback
@@ -13,7 +20,9 @@ overhead (see ``benchmark_transport`` and docs/build-log.md).
 Fail-closed (03 §7): ANY sidecar failure — unreachable, timeout,
 non-2xx, malformed decision — raises :class:`OpaUnavailable`. The
 policy engine catches it and denies (the pinned default-deny), never
-passes through.
+passes through. The external mode keeps the identical contract: the
+Rego decision contract is unchanged (policy decides; this client only
+transports).
 """
 
 from __future__ import annotations
@@ -107,6 +116,11 @@ class OpaClient:
     terminates it. ``decide(input_doc)`` POSTs the versioned input
     document and returns the decision object
     (``{"effect", "rule", ...}``). Any failure raises OpaUnavailable.
+
+    External mode: pass ``external_url`` (or set ``GATEWAY_OPA_URL``).
+    No subprocess is launched and no binary is needed; ``start()``
+    becomes a readiness probe against the URL and ``decide()`` POSTs
+    to it. Fail-closed semantics are identical.
     """
 
     def __init__(
@@ -119,21 +133,44 @@ class OpaClient:
         unix_socket: Optional[str] = None,
         startup_timeout: float = 20.0,
         request_timeout: float = 5.0,
+        external_url: Optional[str] = None,
     ) -> None:
-        self.binary = resolve_binary(binary)
-        self.policies_dir = Path(policies_dir) if policies_dir else default_policies_dir()
+        env_url = os.environ.get("GATEWAY_OPA_URL")
+        self.external_url: Optional[str] = (
+            external_url if external_url is not None else env_url
+        ) or None
+        if self.external_url:
+            self.external_url = self.external_url.rstrip("/")
+        #: True when talking to an external OPA server (no sidecar).
+        self._external = self.external_url is not None
+        self._external_up = False
+        if self._external:
+            # No binary, no socket: the server is someone else's
+            # responsibility (the compose ``opa`` service). Binary
+            # resolution is skipped so a missing vendored binary is not
+            # an error in this mode.
+            self.binary: Optional[Path] = None
+            self.policies_dir = (
+                Path(policies_dir) if policies_dir else default_policies_dir()
+            )
+            self.unix_socket: Optional[str] = None
+        else:
+            self.binary = resolve_binary(binary)
+            self.policies_dir = (
+                Path(policies_dir) if policies_dir else default_policies_dir()
+            )
+            # UDS is the default transport (measured faster; see build log).
+            # An explicit unix_socket=None + host/port keeps TCP available.
+            self._want_uds = unix_socket != ""
+            if unix_socket is None and self._want_uds:
+                self.unix_socket = str(
+                    Path(tempfile.gettempdir())
+                    / f"gateway-opa-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+                )
+            else:
+                self.unix_socket = unix_socket
         self.host = host
         self.port = port
-        # UDS is the default transport (measured faster; see build log).
-        # An explicit unix_socket=None + host/port keeps TCP available.
-        self._want_uds = unix_socket != ""
-        if unix_socket is None and self._want_uds:
-            self.unix_socket: Optional[str] = str(
-                Path(tempfile.gettempdir())
-                / f"gateway-opa-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
-            )
-        else:
-            self.unix_socket = unix_socket
         self.startup_timeout = startup_timeout
         self.request_timeout = request_timeout
         self._proc: Optional[subprocess.Popen] = None
@@ -148,11 +185,21 @@ class OpaClient:
 
     @property
     def running(self) -> bool:
+        if self._external:
+            return self._external_up
         return self._proc is not None and self._proc.poll() is None
 
     def start(self) -> None:
-        """Launch the sidecar (idempotent). Raises OpaUnavailable."""
+        """Launch the sidecar (idempotent). Raises OpaUnavailable.
+
+        External mode: no subprocess — readiness-probe the URL instead.
+        """
         with self._lock:
+            if self._external:
+                if self._external_up:
+                    return
+                self._start_external_locked()
+                return
             if self.running:
                 return
             if self.unix_socket:
@@ -199,6 +246,48 @@ class OpaClient:
                     trust_env=False,
                 )
 
+    def _start_external_locked(self) -> None:
+        """Readiness probe for external mode (caller holds the lock).
+
+        No subprocess is launched. On success a keep-alive client is
+        created; on timeout raises OpaUnavailable (fail-closed). After
+        the first success, per-decide liveness is the POST itself: any
+        transport failure in decide() raises OpaUnavailable and the
+        policy engine denies.
+        """
+        url = self.external_url
+        assert url is not None
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise OpaUnavailable(
+                f"GATEWAY_OPA_URL must be an http(s) URL, got {url!r}"[:160]
+            )
+        log.info("using external OPA at %s (no sidecar subprocess)", url)
+        deadline = time.monotonic() + self.startup_timeout
+        last: Optional[str] = None
+        # Sidecar traffic is always cluster-local: never route it
+        # through an egress proxy (trust_env=False), same as the
+        # sidecar path.
+        with httpx.Client(timeout=2, trust_env=False) as probe:
+            while time.monotonic() < deadline:
+                try:
+                    r = probe.get(f"{url}/health")
+                    if 200 <= r.status_code < 300:
+                        self._http = httpx.Client(
+                            base_url=url,
+                            timeout=self.request_timeout,
+                            trust_env=False,
+                        )
+                        self._external_up = True
+                        return
+                    last = f"HTTP {r.status_code}"
+                except Exception as exc:  # noqa: BLE001 — not ready yet
+                    last = str(exc)[:200]
+                time.sleep(0.5)
+        raise OpaUnavailable(
+            f"external OPA at {url} not ready after "
+            f"{self.startup_timeout}s: {last}"
+        )
+
     def _wait_ready(self) -> None:
         deadline = time.monotonic() + self.startup_timeout
         last: Optional[Exception] = None
@@ -244,6 +333,7 @@ class OpaClient:
             except Exception:  # noqa: BLE001
                 pass
             self._http = None
+        self._external_up = False
         proc, self._proc = self._proc, None
         if proc is not None and proc.poll() is None:
             proc.terminate()

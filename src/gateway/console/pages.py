@@ -23,6 +23,7 @@ from ..audit import AuditLog
 from ..config import Settings
 from ..identity import IdentityService
 from ..inspection.redaction import RedactionCatalog
+from ..latency import AC11_BUDGET_MS, recorder
 from ..mandates import MandateService
 from ..models import (
     AdminUser,
@@ -198,6 +199,62 @@ def register_dashboard(
             "dashboard.html", active="dashboard", csrf_token=token,
             stop_ack=ack, **data,
         )
+        csrf.set_cookie(resp, token)
+        return resp
+
+
+# ---------------------------------------------------------------------
+# Latency (AC-11): live per-stage p50/p95/max + judge backend (hackathon demo)
+# ---------------------------------------------------------------------
+
+_STAGE_ORDER = ("policy", "inspection", "judge")
+_STAGE_DESCRIPTIONS = {
+    "policy": "OPA decide call (policy evaluation, ms)",
+    "inspection": "output-inspection stage (ms)",
+    "judge": "advisory judge cascade (ms; label = backend path)",
+}
+
+
+def _judge_backend_summary(settings: Settings) -> dict[str, Any]:
+    """What judge backend the gateway is configured to use.
+
+    Reads straight from settings — the backend line is config truth,
+    never a placeholder. ``escalation`` is ``"none"`` unless an
+    escalation backend is configured (see ``judge_escalation`` in
+    config.py).
+    """
+    return {
+        "backend": (getattr(settings, "judge_backend", "none") or "none").strip().lower(),
+        "enabled": bool(getattr(settings, "judge_enabled", False)),
+        "always_on": bool(getattr(settings, "judge_always_on", False)),
+        "escalation": getattr(settings, "judge_escalation", "none") or "none",
+        "timeout_s": getattr(settings, "judge_timeout_s", 2.0),
+    }
+
+
+def register_latency(app: Any, settings: Settings, csrf: CsrfProtector) -> None:
+    @app.get("/latency", response_class=HTMLResponse)
+    def latency_page() -> HTMLResponse:
+        # Every number below is computed from the in-memory ring
+        # buffer at read time (gateway.latency). Empty stages render
+        # an honest "no samples yet" state — never placeholders.
+        stages = [
+            {
+                "name": name,
+                "desc": _STAGE_DESCRIPTIONS[name],
+                "stats": recorder.stats(name),
+                "labels": recorder.labels(name),
+            }
+            for name in _STAGE_ORDER
+        ]
+        data = {
+            "stages": stages,
+            "has_data": any(s["stats"] is not None for s in stages),
+            "budget_ms": AC11_BUDGET_MS,
+            "judge": _judge_backend_summary(settings),
+        }
+        token = csrf.issue()
+        resp = _RENDER("latency.html", active="latency", csrf_token=token, **data)
         csrf.set_cookie(resp, token)
         return resp
 
@@ -1031,6 +1088,7 @@ def register_m6_pages(
     global _RENDER
     _RENDER = render_page
     register_dashboard(app, config_session_factory, audit_session_factory, settings, csrf)
+    register_latency(app, settings, csrf)
     register_connectors(app, csrf, health)
     register_policies(app, config_session_factory, audit_session_factory, settings, csrf)
     register_vault_settings(

@@ -375,6 +375,16 @@ class GatewayApp:
             ],
         )
 
+        # Demo connector (docker-compose one-command demo only). Default
+        # OFF: enabled explicitly via GATEWAY_DEMO_TOOLS=1. Registers
+        # demo.read (seeded allow rule) and demo.write (default-deny)
+        # so the smoke test can assert one ALLOW and one DENY through
+        # the real MCP endpoint. Never enable in production.
+        if _os.environ.get("GATEWAY_DEMO_TOOLS") == "1":
+            from .demo_tools import make_demo_tools
+
+            self.register_connector_tools("demo", make_demo_tools())
+
     def _register_tool_on_mcp(self, d: Any) -> None:
         self.mcp.add_tool(
             FunctionTool(

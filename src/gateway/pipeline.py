@@ -43,6 +43,7 @@ from .hmac_util import HmacKeyRing, argument_hash
 from .ids import new_request_id
 from .identity import IdentityService
 from .inspection.output import InspectOutputStage, InspectionConfig
+from .latency import record
 from .inspection.rate_limit import RateLimiter
 from .inspection.redaction import RedactionCatalog, redact_ctx_for_audit
 from .inspection.urgency_flags import scan_trigger_content
@@ -694,6 +695,17 @@ class Pipeline:
         for stage in self.stages:
             with timing_span(ctx, f"stage:{stage.name}"):
                 error = stage.run(ctx)
+            if stage.name == "inspect_output":
+                # AC-11: record the inspection-stage latency measured by
+                # the timing_span above (no second timer), labeled with
+                # the stage outcome. Advisory-only: no change to stage
+                # logic, ordering, or error handling.
+                ms = ctx.spans.get("stage:inspect_output")
+                if ms is not None:
+                    record(
+                        "inspection", ms,
+                        label=error.code if error is not None else "ok",
+                    )
             if error is not None:
                 halted_at = stage.name
                 ctx.decision = _decision_for_error(error)
@@ -765,13 +777,15 @@ def _judge_wiring(
     ``GATEWAY_JUDGE_ENABLED=1``. When enabled without an explicit
     cascade, the cascade is built from settings
     (``GATEWAY_JUDGE_BACKEND``; ``"none"`` → DisabledBackend →
-    JudgeUnavailable → deterministic fallback everywhere). Imports are
+    JudgeUnavailable → deterministic fallback everywhere) with the
+    escalation backend named by ``GATEWAY_JUDGE_ESCALATION``
+    (``"none"`` default → no escalation). Imports are
     lazy: the judge package is untouched when the hooks are off.
     """
     if not getattr(settings, "judge_enabled", False):
         return None, None
     from .judge.cascade import JudgeCascade
-    from .judge.factory import backend_from_settings
+    from .judge.factory import backend_from_settings, escalation_from_settings
     from .judge.inspection_hook import JudgeInspectionHook
     from .judge.risk import build_risk_scorer
 
@@ -779,7 +793,7 @@ def _judge_wiring(
     if cascade is None:
         cascade = JudgeCascade(
             primary=backend_from_settings(settings),
-            escalation=None,
+            escalation=escalation_from_settings(settings),
             threshold=0.75,
             timeout_s=getattr(settings, "judge_timeout_s", 2.0),
         )

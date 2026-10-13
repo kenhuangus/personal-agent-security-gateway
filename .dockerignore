@@ -1,0 +1,13 @@
+# Keep the build context small: only what the Dockerfiles COPY is sent to
+# the daemon (notably NOT .venv/ or .git/).
+*
+!pyproject.toml
+!README.md
+!src/
+!src/**
+!scripts/
+!scripts/**
+!third_party/
+!third_party/**
+!docker/
+!docker/**

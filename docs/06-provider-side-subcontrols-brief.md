@@ -1,7 +1,7 @@
-# PAA10 Provider-Side Sub-Controls — Input Brief for the OWASP Project
+# PAA10 Provider-Side Sub-Controls — Input Brief for a Candidate OWASP Project
 
 **Source:** Personal Agent Security Gateway PAA10 mapping (`05-paa10-mapping.md`, completed 2026-10-12 ~15:35 EDT).
-**Status:** Input for the proposed OWASP "Top 10 for Personal AI Agents" project. Not a gateway feature list — these controls sit outside anything a gateway-class intermediary can enforce.
+**Status:** Input for a candidate OWASP project. Not a gateway feature list — these controls sit outside anything a gateway-class intermediary can enforce.
 
 ## Why this exists
 
@@ -63,7 +63,7 @@ stop" has no meaning for work outside gateway tool calls. Full list: `05-paa10-m
 
 ## Suggested use
 
-Hand to the proposed co-leads as scenario/evaluation input (Iftach: control tests need
+Hand to the candidate project's team as scenario/evaluation input (control tests need
 provider cooperation — these are the boundaries a reference implementation cannot
-cross alone) and as provider-companion material (Dean: the "which layer is responsible"
-analysis the project roadmap calls for).
+cross alone) and as provider-companion material (the "which layer is responsible"
+analysis a project roadmap calls for).

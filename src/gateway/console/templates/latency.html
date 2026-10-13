@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Latency{% endblock %}
+{% block content %}
+<h1>Latency</h1>
+<p class="note">Live per-stage latencies measured from the in-memory ring buffer
+(last 1000 samples per stage). AC-11 budget: <strong>{{ budget_ms|int }} ms</strong> per stage —
+p95 values over budget are highlighted red.</p>
+
+{% if not has_data %}
+<div class="card">
+  <p class="note"><strong>No data yet.</strong> No instrumented pipeline stages have run
+  in this process. Route tool calls through the gateway (or invoke the judge cascade)
+  and refresh this page.</p>
+</div>
+{% else %}
+<table>
+  <tr><th>Stage</th><th>Samples</th><th>p50 (ms)</th><th>p95 (ms)</th><th>Max (ms)</th><th>Labels</th></tr>
+  {% for s in stages %}
+  <tr>
+    <td><strong>{{ s.name }}</strong><br><span class="note">{{ s.desc }}</span></td>
+    {% if s.stats %}
+    <td>{{ s.stats.count }}</td>
+    <td>{{ "%.2f"|format(s.stats.p50) }}</td>
+    <td><span class="badge {% if s.stats.p95 > budget_ms %}denied{% else %}allowed{% endif %}">{{ "%.2f"|format(s.stats.p95) }}</span></td>
+    <td>{{ "%.2f"|format(s.stats.max) }}</td>
+    <td>{% for label, n in s.labels.items() %}<code>{{ label or "(unlabeled)" }}</code> &times;{{ n }}{% if not loop.last %}<br>{% endif %}{% endfor %}</td>
+    {% else %}
+    <td colspan="4"><span class="note">no samples yet</span></td>
+    <td></td>
+    {% endif %}
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+<h2>Judge backend</h2>
+<table>
+  <tr><th>Setting</th><th>Value</th></tr>
+  <tr><td>Backend</td><td><code>{{ judge.backend }}</code></td></tr>
+  <tr><td>Hooks enabled</td><td><span class="badge {% if judge.enabled %}allowed{% else %}paused{% endif %}">{{ "yes" if judge.enabled else "no" }}</span></td></tr>
+  <tr><td>Always-on (every tool output)</td><td>{{ "yes" if judge.always_on else "no" }}</td></tr>
+  <tr><td>Escalation backend</td><td><code>{{ judge.escalation }}</code></td></tr>
+  <tr><td>Per-decide timeout</td><td>{{ judge.timeout_s }} s</td></tr>
+</table>
+{% if not judge.enabled %}
+<p class="note">Judge hooks are disabled: no <code>judge</code> spans will be recorded.
+Enable with <code>GATEWAY_JUDGE_ENABLED=1</code>.</p>
+{% endif %}
+{% endblock %}

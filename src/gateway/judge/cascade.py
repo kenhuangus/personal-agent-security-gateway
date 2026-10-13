@@ -28,6 +28,20 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .client import Answer, DecisionBackend, JudgeUnavailable, Question
+from ..latency import record
+
+
+def _judge_span_label(result: "CascadeResult") -> str:
+    """Span label for a cascade result: the backend path in order.
+
+    e.g. ``"kev"``, ``"kev|glimmer:escalated"``, ``"kev:low_confidence"``.
+    """
+    label = "|".join(result.backend_path)
+    if result.escalated:
+        label += ":escalated"
+    if result.low_confidence:
+        label += ":low_confidence"
+    return label
 
 
 @dataclass(frozen=True)
@@ -72,7 +86,22 @@ class JudgeCascade:
     def decide(
         self, state: str, questions: list[Question]
     ) -> CascadeResult:
-        """Run the cascade. Raises JudgeUnavailable when no backend answers."""
+        """Run the cascade. Raises JudgeUnavailable when no backend answers.
+
+        Records one ``judge`` latency span per successful cascade using
+        the ``latency_ms`` already measured on the result (no second
+        timer). Nothing is recorded when the judge is disabled or the
+        cascade raises (the fail-closed path) — the span label is the
+        backend path, observability only.
+        """
+        result = self._decide_inner(state, questions)
+        record("judge", result.latency_ms, label=_judge_span_label(result))
+        return result
+
+    def _decide_inner(
+        self, state: str, questions: list[Question]
+    ) -> CascadeResult:
+        """The cascade body. Raises JudgeUnavailable when no backend answers."""
         path = [self.primary.name]
         start = time.perf_counter()
         try:
