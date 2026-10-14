@@ -1993,3 +1993,56 @@ AC-11 budget; the instrumentation itself does not touch the budget.
   runtime, `repr=False` in Settings); no code copied from other repos
   (adapter written from the OpenAI chat-completions contract).
 
+
+## Fix #10 — atomic rate-limiter increment (2026-10-13, medium fix worker)
+
+Missed in Batch 2; filled as a single-issue PR (branch `fix/mediums-c`,
+PR workflow — no merge without Ken's approval).
+
+### What was wrong (verified against main before fixing)
+`RateLimiter._check_window` (`src/gateway/inspection/rate_limit.py`)
+did select → Python-side `row.count += 1` → `commit()` with no row lock.
+Concurrent in-flight requests for the same agent interleave
+read-read-write-write, so N concurrent requests can all observe
+`count < limit` and all be admitted — per-minute/per-day budgets
+exceeded by up to the concurrency factor. SQLite serializes commits
+but does not prevent the lost-update interleaving across sessions.
+Classic TOCTOU on an abuse control, exactly as the issue described.
+
+### The fix
+`_check_window` now delegates the count to a new `_increment()`:
+single conditional `UPDATE rate_counters SET count = count + 1
+WHERE agent_id=? AND window=? AND window_start=? AND count < limit
+RETURNING count`. Budget check and increment are one statement — no
+lost update possible; a rejected attempt never consumes budget
+(FR-028 semantics preserved, including the `rate_limited` +
+`retry_after` error shape and the disabled-budget `limit <= 0` path).
+Row creation on the first attempt of a window is guarded by the
+existing `uq_rate_counter` unique constraint: the loser of a
+concurrent INSERT rolls back (IntegrityError) and retries the atomic
+UPDATE, which then sees the existing row. Chosen over
+`SELECT ... FOR UPDATE` because SQLite does not support it; the
+single-statement form also ports unchanged to Postgres (the
+db.py migration seam). `check()`, `_prune()`, and the `count()`
+introspection surface are unchanged.
+
+### Tests
+- New `TestRateLimitAtomicity::test_concurrent_increments_never_exceed_budget`
+  (`tests/test_inspection.py`): 25 threads (own session each, released
+  together on a barrier for maximum contention) hammer one agent's
+  minute budget of 10 → exactly 10 admitted, 15 rejected, persisted
+  count exactly 10.
+- Regression check: the new test FAILS against the pre-fix code
+  (budget over-admitted under contention) and PASSES with the fix.
+- Rate-limit subset: 5 passed. Full suite: **616 passed, 8 skipped**
+  (0:20:07), run with `TMPDIR=/home/hatch/workspace/.tmp-pytest`
+  per the /tmp-tmpfs environment lesson. Live kev tier skipped
+  (opt-in, untouched on 127.0.0.1:8009).
+
+### Invariants held
+- Fix A (auth wall), Fix B (approval flow), Rego decision contract,
+  fail-closed, judge advisory-only — untouched.
+- No secrets/API keys in repo or tests; no model weights; stealth
+  wording preserved ("candidate OWASP project" only — no such wording
+  added or needed).
+- `.github/` untouched per task.
