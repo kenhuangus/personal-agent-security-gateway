@@ -38,6 +38,12 @@ ADMIN_PASSWORD = "correct horse battery staple"
 @pytest.fixture()
 def settings(tmp_path, monkeypatch):
     monkeypatch.setenv("GATEWAY_KMS_KEY", generate_kms_key())
+    # The TestClient speaks plain HTTP, and a Secure cookie is never
+    # sent back over HTTP (correct browser behavior) — so the console
+    # integration tests opt out exactly as documented for local HTTP
+    # development (issue #5). The default-true path is covered by
+    # test_session_cookie_secure_flag_defaults_on.
+    monkeypatch.setenv("GATEWAY_CONSOLE_COOKIE_SECURE", "0")
     return Settings(
         config_db_path=str(tmp_path / "config.db"),
         audit_db_path=str(tmp_path / "audit.db"),
@@ -235,6 +241,101 @@ class TestAdminAuth:
         with dbs.audit.session() as adb:
             rows = AuditLog(adb).search(agent_id="admin", tool="admin.login")
             assert any(e.reason == "locked_out" for e in rows)
+
+    def test_account_lockout_after_15_failures_across_ips(self, dbs, settings):
+        # Issue #4: rotating the source IP must not buy unlimited
+        # guesses — 15 total consecutive failures lock the account.
+        # (TestClient always reports one IP, so this drives
+        # AdminAuth.login directly with rotating client IPs.)
+        import pyotp
+
+        auth = AdminAuth(settings, dbs.audit.session)
+        with dbs.config.session() as db:
+            secret = auth.setup_admin(db, ADMIN_PASSWORD)
+        for i in range(15):
+            with dbs.config.session() as db:
+                ok, reason = auth.login(
+                    db, "wrong password here", "000000", f"10.0.0.{i}"
+                )
+                assert (ok, reason) == (False, "invalid_password")
+        # 16th attempt from a FRESH ip with the RIGHT credentials:
+        # the account is locked, not just the per-IP guard.
+        with dbs.config.session() as db:
+            ok, reason = auth.login(
+                db, ADMIN_PASSWORD, pyotp.TOTP(secret).now(), "10.9.9.9"
+            )
+        assert (ok, reason) == (False, "locked_out")
+        with dbs.config.session() as db:
+            user = db.get(AdminUser, ADMIN_ID)
+            assert user.failed_logins == 15
+            assert user.locked_until is not None
+
+    def test_successful_login_resets_account_failure_counter(
+        self, dbs, settings
+    ):
+        import pyotp
+
+        auth = AdminAuth(settings, dbs.audit.session)
+        with dbs.config.session() as db:
+            secret = auth.setup_admin(db, ADMIN_PASSWORD)
+        for i in range(14):
+            with dbs.config.session() as db:
+                auth.login(db, "wrong password here", "000000", f"10.0.0.{i}")
+        # A success resets the consecutive-failure counter...
+        with dbs.config.session() as db:
+            ok, _ = auth.login(
+                db, ADMIN_PASSWORD, pyotp.TOTP(secret).now(), "10.0.0.200"
+            )
+        assert ok
+        with dbs.config.session() as db:
+            user = db.get(AdminUser, ADMIN_ID)
+            assert user.failed_logins == 0
+            assert user.locked_until is None
+        # ...so 14 more failures do not trip the account lockout.
+        for i in range(14):
+            with dbs.config.session() as db:
+                ok, reason = auth.login(
+                    db, "wrong password here", "000000", f"10.0.1.{i}"
+                )
+                assert (ok, reason) == (False, "invalid_password")
+
+    def test_session_cookie_secure_flag_defaults_on(
+        self, dbs, settings, monkeypatch
+    ):
+        # Issue #5: the admin session cookie carries Secure by default.
+        # (The settings fixture opts out for plain-HTTP TestClient
+        # runs, so build a fresh Settings with the env var absent to
+        # observe the true default.)
+        from gateway.config import Settings as SettingsCls
+
+        monkeypatch.delenv("GATEWAY_CONSOLE_COOKIE_SECURE", raising=False)
+        assert SettingsCls().console_cookie_secure is True
+        auth = AdminAuth(SettingsCls(), dbs.audit.session)
+        seen = {}
+
+        class _Resp:
+            def set_cookie(self, name, value, **kwargs):
+                seen.update(kwargs)
+
+        auth.set_session_cookie(_Resp(), "token")
+        assert seen["secure"] is True
+        assert seen["httponly"] is True
+        assert seen["samesite"] == "strict"
+
+    def test_session_cookie_secure_flag_opt_out(self, dbs, settings):
+        # Local HTTP dev can opt out via the setting.
+        import dataclasses
+
+        dev_settings = dataclasses.replace(settings, console_cookie_secure=False)
+        auth = AdminAuth(dev_settings, dbs.audit.session)
+        seen = {}
+
+        class _Resp:
+            def set_cookie(self, name, value, **kwargs):
+                seen.update(kwargs)
+
+        auth.set_session_cookie(_Resp(), "token")
+        assert seen["secure"] is False
 
     def test_csrf_rejected_on_state_changing_routes(self, authed, dbs):
         client, _secret = authed

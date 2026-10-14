@@ -41,7 +41,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from gateway.approval_card import build_card, render_inert_html
+from gateway.approval_card import build_card, build_evidence_subset, render_inert_html
 from gateway.approvals import (
     DESTRUCTIVE_TOOLS,
     ApprovalService,
@@ -778,6 +778,189 @@ class TestEvidenceSubset:
         redacted = redact_full_args({"body": "code 123456", "to": ["a@b.c"]})
         assert "123456" not in json.dumps(redacted)
         assert redacted["to"] == ["a@b.c"]
+
+
+# ---------------------------------------------------------------------------
+# content_hash binds the bytes that execute (issue #3)
+# ---------------------------------------------------------------------------
+
+
+class TestContentHashBindsReplayArgs:
+    def test_email_send_hash_covers_exact_replay_args(self, ring):
+        body = "Invoice 20261013 for order 482916 is due."
+        ev = build_evidence_subset(
+            "email.send",
+            {"to": ["a@b.c"], "subject": "s", "body": body},
+            ring,
+        )
+        # Single source of truth: the hash binds replay_args exactly,
+        # so it can be recomputed at replay time.
+        from gateway.approval_card import _content_hash
+
+        assert ev["content_hash"] == _content_hash(ev["replay_args"], ring)
+        # What executes is the RAW body — digits intact, never mangled
+        # by the display redactor.
+        assert ev["replay_args"]["body"] == body
+        assert "20261013" in ev["replay_args"]["body"]
+        assert "482916" in ev["replay_args"]["body"]
+        # Redaction stays in the display preview only.
+        assert "482916" not in ev["body_preview"]
+        assert "[redacted:code]" in ev["body_preview"]
+
+    def test_code_pr_open_hash_covers_exact_replay_args(self, ring):
+        body = "Fixes ticket 12345678."
+        ev = build_evidence_subset(
+            "code.pr.open",
+            {"repo": "o/r", "title": "t", "head": "h", "base": "b",
+             "body": body},
+            ring,
+        )
+        from gateway.approval_card import _content_hash
+
+        assert ev["content_hash"] == _content_hash(ev["replay_args"], ring)
+        assert ev["replay_args"]["body"] == body
+        assert "12345678" not in ev["body_preview"]
+
+    def test_calendar_create_hash_covers_full_replay_args(self, ring):
+        args = {"title": "t", "start": "s", "end": "e",
+                "attendees": ["a@b.c"], "description": "d",
+                "location": "l"}
+        ev = build_evidence_subset("calendar.create", args, ring)
+        from gateway.approval_card import _content_hash
+
+        assert ev["content_hash"] == _content_hash(ev["replay_args"], ring)
+        assert ev["replay_args"]["location"] == "l"
+
+
+# ---------------------------------------------------------------------------
+# preview_redacted signal + WYSIWYE card warning (PR #34 HOLD)
+#
+# Regression: the card rendered only the redacted body_preview with
+# no indicator that replay sends the RAW body. An agent could hide a
+# secret in the body, the card would show [redacted:code], and the
+# approver would approve the raw secret being sent.
+# ---------------------------------------------------------------------------
+
+class TestPreviewRedactedWarning:
+    def test_email_send_evidence_marks_redacted_preview(self, ring):
+        body = "Here is the secret: my verification code is 482916."
+        ev = build_evidence_subset(
+            "email.send",
+            {"to": ["a@b.c"], "subject": "s", "body": body},
+            ring,
+        )
+        assert ev["preview_redacted"] is True
+        assert ev["preview_redacted_count"] == 1
+        assert "482916" not in ev["body_preview"]
+        # The raw body still executes — and the hash still binds it.
+        from gateway.approval_card import _content_hash
+
+        assert ev["replay_args"]["body"] == body
+        assert ev["content_hash"] == _content_hash(ev["replay_args"], ring)
+
+    def test_code_pr_open_evidence_marks_redacted_preview(self, ring):
+        body = "Fixes ticket 12345678."
+        ev = build_evidence_subset(
+            "code.pr.open",
+            {"repo": "o/r", "title": "t", "head": "h", "base": "b",
+             "body": body},
+            ring,
+        )
+        assert ev["preview_redacted"] is True
+        assert ev["preview_redacted_count"] == 1
+        assert ev["replay_args"]["body"] == body
+
+    def test_clean_preview_marks_not_redacted(self, ring):
+        ev = build_evidence_subset(
+            "email.send",
+            {"to": ["a@b.c"], "subject": "s",
+             "body": "No secrets here, just a status update."},
+            ring,
+        )
+        assert ev["preview_redacted"] is False
+        assert ev["preview_redacted_count"] == 0
+
+    def test_multiple_secrets_counted(self, ring):
+        ev = build_evidence_subset(
+            "email.send",
+            {"to": ["a@b.c"], "subject": "s",
+             "body": "first code 123456 and second code 654321"},
+            ring,
+        )
+        assert ev["preview_redacted"] is True
+        assert ev["preview_redacted_count"] == 2
+
+    def test_card_warns_when_preview_redacted(
+        self, dbs, settings, ring, registry, agent, config_db
+    ):
+        with dbs.config.session() as cdb:
+            _require_approval_rule(cdb)
+        args = dict(
+            SEND_ARGS,
+            body="Here is the secret: my verification code is 482916.",
+        )
+        outcome, _ = _run(dbs, settings, ring, registry, agent, "email.send", args)
+        apr_id = _approval_required_body(outcome)["approval_request_id"]
+        with dbs.config.session() as cdb:
+            apr = cdb.get(ApprovalRequest, apr_id)
+            assert apr.evidence_subset["preview_redacted"] is True
+            card = build_card(
+                apr, agent_display_name="Muse", mandate=None,
+                cap_used=1, cap_total=5, recorded_criteria=None,
+                destructive=False, now=dt.datetime.now(dt.timezone.utc),
+            )
+            html_out = render_inert_html(card)
+        assert card["preview_redacted"] is True
+        assert card["preview_redacted_count"] == 1
+        # The redacted secret itself never leaks onto the card.
+        assert "482916" not in html_out
+        assert "[redacted:code]" in html_out
+        # …but the approver is warned the raw body will be sent verbatim.
+        assert "preview redacted 1 secrets — raw body will be sent verbatim" in html_out
+
+    def test_card_silent_when_preview_clean(
+        self, dbs, settings, ring, registry, agent, config_db
+    ):
+        with dbs.config.session() as cdb:
+            _require_approval_rule(cdb)
+        outcome, _ = _run(dbs, settings, ring, registry, agent, "email.send", dict(SEND_ARGS))
+        apr_id = _approval_required_body(outcome)["approval_request_id"]
+        with dbs.config.session() as cdb:
+            apr = cdb.get(ApprovalRequest, apr_id)
+            card = build_card(
+                apr, agent_display_name="Muse", mandate=None,
+                cap_used=1, cap_total=5, recorded_criteria=None,
+                destructive=False, now=dt.datetime.now(dt.timezone.utc),
+            )
+            html_out = render_inert_html(card)
+        assert card["preview_redacted"] is False
+        assert "raw body will be sent verbatim" not in html_out
+
+    def test_card_recovers_signal_for_legacy_evidence(
+        self, dbs, settings, ring, registry, agent, config_db
+    ):
+        """Pre-fix evidence rows carry no signal; build_card recomputes
+        it from the replay body so old approvals still warn."""
+        with dbs.config.session() as cdb:
+            _require_approval_rule(cdb)
+        args = dict(
+            SEND_ARGS,
+            body="Here is the secret: my verification code is 482916.",
+        )
+        outcome, _ = _run(dbs, settings, ring, registry, agent, "email.send", args)
+        apr_id = _approval_required_body(outcome)["approval_request_id"]
+        with dbs.config.session() as cdb:
+            apr = cdb.get(ApprovalRequest, apr_id)
+            del apr.evidence_subset["preview_redacted"]
+            del apr.evidence_subset["preview_redacted_count"]
+            card = build_card(
+                apr, agent_display_name="Muse", mandate=None,
+                cap_used=1, cap_total=5, recorded_criteria=None,
+                destructive=False, now=dt.datetime.now(dt.timezone.utc),
+            )
+            html_out = render_inert_html(card)
+        assert card["preview_redacted"] is True
+        assert "preview redacted 1 secrets — raw body will be sent verbatim" in html_out
 
 
 # ---------------------------------------------------------------------------

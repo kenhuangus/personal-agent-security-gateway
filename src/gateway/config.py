@@ -28,6 +28,13 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Settings:
     """All gateway configuration. Read once at process startup."""
@@ -111,6 +118,13 @@ class Settings:
     # Base URL of the admin console, used to build the console link in
     # notifier messages (fixed allowlist field). Empty → relative path.
     console_base_url: str = field(default_factory=lambda: _env("GATEWAY_CONSOLE_URL", ""))
+    # Admin session cookie Secure flag (issue #5): when true the
+    # ``gw_admin`` cookie is only sent over HTTPS. Default true;
+    # set GATEWAY_CONSOLE_COOKIE_SECURE=0 for local HTTP development.
+    # Never disable in production.
+    console_cookie_secure: bool = field(
+        default_factory=lambda: _env_bool("GATEWAY_CONSOLE_COOKIE_SECURE", True)
+    )
 
     # --- admin bootstrap (M6 console; values seeded by operator) ---
     admin_password_hash: str = field(default_factory=lambda: _env("GATEWAY_ADMIN_PASSWORD_HASH", ""), repr=False)

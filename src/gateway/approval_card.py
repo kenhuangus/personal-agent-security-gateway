@@ -16,6 +16,13 @@ INERT-RENDERING CONTRACT (MF-6):
 - Code-like secrets (verification codes, OTPs, API-key-shaped strings)
   are redacted even in the evidence preview (FR-PAA02-001) — recipient,
   amount/currency, and audience stay cleartext.
+- Because the preview is redacted but replay sends the RAW body, the
+  evidence carries ``preview_redacted`` / ``preview_redacted_count``
+  (set when redaction changed the preview), and the card renders a
+  prominent warning for the raw-body tools (``email.send`` /
+  ``code.pr.open``): "preview redacted N secrets — raw body will be
+  sent verbatim". The approver must never mistake the redacted
+  preview for the bytes that execute (WYSIWYE).
 - No urgency language appears anywhere on the card (FR-PAA09-001):
   urgency PHRASES from the trigger content are reported as detected
   FLAGS, never repeated as calls to action.
@@ -54,6 +61,24 @@ _CODE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 _BARE_CODE_RE = re.compile(r"\b[0-9]{6,8}\b")
 
 
+def redact_code_like_secrets_with_count(text: str) -> tuple[str, int]:
+    """Redact verification codes, OTPs, API-key-shaped strings.
+
+    Returns ``(redacted_text, replacement_count)``. The count is the
+    number of redaction substitutions applied — the ``preview_redacted``
+    signal is derived from it (count > 0 means the preview differs
+    from the raw bytes that replay will send).
+    """
+    if not text:
+        return text, 0
+    redacted = text
+    total = 0
+    for label, pattern in _CODE_PATTERNS:
+        redacted, n = pattern.subn(f"[redacted:{label}]", redacted)
+        total += n
+    return redacted, total
+
+
 def redact_code_like_secrets(text: str) -> str:
     """Redact verification codes, OTPs, API-key-shaped strings.
 
@@ -61,12 +86,14 @@ def redact_code_like_secrets(text: str) -> str:
     execute-on-approval result summary. Recipient/payee,
     amount/currency, and audience are NOT redacted here.
     """
-    if not text:
-        return text
-    redacted = text
-    for label, pattern in _CODE_PATTERNS:
-        redacted = pattern.sub(f"[redacted:{label}]", redacted)
-    return redacted
+    return redact_code_like_secrets_with_count(text)[0]
+
+
+#: Tools whose execute-on-approval replay sends the raw body verbatim
+#: (``replay_args["body"]``), while the card shows only the redacted
+#: ``body_preview``. These are the tools that MUST carry the
+#: preview-redacted warning on the card (WYSIWYE).
+RAW_BODY_TOOLS: frozenset[str] = frozenset({"email.send", "code.pr.open"})
 
 
 # ---------------------------------------------------------------------
@@ -111,6 +138,16 @@ def detect_sponsor_signals(text: str) -> list[str]:
 # replay-complete for the execute-on-approval fallback (MF-11): the
 # server-side replay rebuilds the call args from this subset alone, so
 # what Ken sees on the card is exactly what executes (WYSIWYE).
+#
+# HASH-BINDING INVARIANT (issue #3): `content_hash` is computed over
+# EXACTLY the `replay_args` dict that will execute — the single source
+# of truth. The hash therefore binds the bytes that execute (and can
+# be recomputed at replay time), never bytes that never run.
+# Redaction applies to display previews (`body_preview`,
+# `*_preview`) ONLY — never to `replay_args`. Because the preview
+# then differs from what executes, each builder also records
+# `preview_redacted` / `preview_redacted_count` so the card can warn
+# the approver that the raw body will be sent verbatim (WYSIWYE).
 # ---------------------------------------------------------------------
 
 def _audience_hash(parts: Any, ring: HmacKeyRing) -> str:
@@ -127,7 +164,8 @@ def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) ->
     Cleartext is LIMITED to recipient/payee, amount/currency, audience,
     and the rendered preview (with code-like secrets redacted). The
     ``replay_args`` entry carries the structured args the
-    execute-on-approval fallback replays server-side.
+    execute-on-approval fallback replays server-side, and
+    ``content_hash`` is computed over exactly that dict (issue #3).
     """
     args = args or {}
     if tool == "email.send":
@@ -137,15 +175,21 @@ def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) ->
         subject = str(args.get("subject") or "")
         body = str(args.get("body") or "")
         audience = {"to": to, "cc": cc, "bcc": bcc}
-        content = {"subject": subject, "body": body}
+        replay_args = {
+            "to": to, "cc": cc, "bcc": bcc,
+            "subject": subject, "body": body,
+        }
+        body_preview, n_redacted = redact_code_like_secrets_with_count(body)
         return {
             "tool": tool,
             "audience": audience,
             "recipients": to + cc + bcc,
             "subject": subject,
-            "body_preview": redact_code_like_secrets(body),
+            "body_preview": body_preview,
+            "preview_redacted": n_redacted > 0,
+            "preview_redacted_count": n_redacted,
             "audience_hash": _audience_hash(audience, ring),
-            "content_hash": _content_hash(content, ring),
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {
                 "payee": to[0] if to else None,
                 "amount": None, "currency": None, "fees": None,
@@ -157,84 +201,97 @@ def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) ->
                 + (f" (+{len(cc)} cc, +{len(bcc)} bcc)" if cc or bcc else "")
                 + f". Subject: {subject[:80]!r}."
             ),
-            "replay_args": {
-                "to": to, "cc": cc, "bcc": bcc,
-                "subject": subject, "body": redact_code_like_secrets(body),
-            },
+            "replay_args": replay_args,
         }
     if tool == "email.settings.write":
         section = str(args.get("section") or "")
         settings_val = args.get("settings") or {}
-        preview = redact_code_like_secrets(canonical_json(settings_val))
+        preview, n_redacted = redact_code_like_secrets_with_count(
+            canonical_json(settings_val))
+        replay_args = {"section": section, "settings": settings_val}
         return {
             "tool": tool,
             "section": section,
             "settings_preview": preview,
-            "content_hash": _content_hash({"section": section, "settings": settings_val}, ring),
+            "preview_redacted": n_redacted > 0,
+            "preview_redacted_count": n_redacted,
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {"payee": None, "amount": None, "currency": None, "fees": None,
                       "dates": None, "recurring": None, "cancellation": None,
                       "note": "recovery-affecting settings change (FR-PAA02-002/003)"},
             "consequence": f"Change mailbox settings section {section!r} (recovery-affecting).",
-            "replay_args": {"section": section, "settings": settings_val},
+            "replay_args": replay_args,
         }
     if tool == "calendar.delete":
         event_id = str(args.get("event_id") or "")
+        replay_args = {"event_id": event_id}
         return {
             "tool": tool,
             "event_id": event_id,
-            "content_hash": _content_hash({"event_id": event_id}, ring),
+            "preview_redacted": False,
+            "preview_redacted_count": 0,
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {"payee": None, "amount": None, "currency": None, "fees": None,
                       "dates": None, "recurring": None, "cancellation": None,
                       "note": "destructive: no undo at the service"},
             "consequence": f"Delete calendar event {event_id!r} (destructive; no undo).",
-            "replay_args": {"event_id": event_id},
+            "replay_args": replay_args,
         }
     if tool == "calendar.create":
         attendees = list(args.get("attendees") or [])
         title = str(args.get("title") or "")
+        replay_args = {k: args.get(k) for k in
+                       ("title", "start", "end", "attendees", "description", "location", "calendar_id")
+                       if args.get(k) is not None}
+        description_preview, n_redacted = redact_code_like_secrets_with_count(
+            str(args.get("description") or ""))
         return {
             "tool": tool,
             "audience": {"attendees": attendees},
             "title": title,
             "start": args.get("start"), "end": args.get("end"),
-            "description_preview": redact_code_like_secrets(str(args.get("description") or "")),
+            "description_preview": description_preview,
+            "preview_redacted": n_redacted > 0,
+            "preview_redacted_count": n_redacted,
             "audience_hash": _audience_hash({"attendees": attendees}, ring),
-            "content_hash": _content_hash(
-                {"title": title, "start": args.get("start"), "end": args.get("end")}, ring),
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {"payee": None, "amount": None, "currency": None, "fees": None,
                       "dates": {"start": args.get("start"), "end": args.get("end")},
                       "recurring": None, "cancellation": None, "note": None},
             "consequence": f"Create event {title!r} with {len(attendees)} attendee(s).",
-            "replay_args": {k: args.get(k) for k in
-                            ("title", "start", "end", "attendees", "description", "location", "calendar_id")
-                            if args.get(k) is not None},
+            "replay_args": replay_args,
         }
     if tool == "code.pr.open":
         body = str(args.get("body") or "")
+        replay_args = {k: args.get(k) for k in ("repo", "title", "head", "base")
+                       if args.get(k) is not None}
+        replay_args["body"] = body
+        body_preview, n_redacted = redact_code_like_secrets_with_count(body)
         return {
             "tool": tool,
             "repo": args.get("repo"),
             "title": args.get("title"),
             "head": args.get("head"), "base": args.get("base"),
-            "body_preview": redact_code_like_secrets(body),
-            "content_hash": _content_hash(
-                {"repo": args.get("repo"), "title": args.get("title"),
-                 "head": args.get("head"), "base": args.get("base"), "body": body}, ring),
+            "body_preview": body_preview,
+            "preview_redacted": n_redacted > 0,
+            "preview_redacted_count": n_redacted,
+            "content_hash": _content_hash(replay_args, ring),
             "terms": {"payee": args.get("repo"), "amount": None, "currency": None, "fees": None,
                       "dates": None, "recurring": None, "cancellation": None,
                       "note": "public write action on the code host"},
             "consequence": f"Open pull request {args.get('title')!r} on {args.get('repo')}.",
-            "replay_args": {k: args.get(k) for k in ("repo", "title", "head", "base")
-                            if args.get(k) is not None} | {"body": redact_code_like_secrets(body)},
+            "replay_args": replay_args,
         }
     # Generic fallback for any other sensitive tool: audience unknown,
     # content = redacted canonical args. Replay is NOT supported for
     # tools without a dedicated builder (execute-on-approval refuses).
-    preview = redact_code_like_secrets(canonical_json(args))
+    preview, n_redacted = redact_code_like_secrets_with_count(canonical_json(args))
     return {
         "tool": tool,
         "content_hash": _content_hash(args, ring),
         "body_preview": preview,
+        "preview_redacted": n_redacted > 0,
+        "preview_redacted_count": n_redacted,
         "terms": {"payee": None, "amount": None, "currency": None, "fees": None,
                   "dates": None, "recurring": None, "cancellation": None,
                   "note": "no dedicated evidence builder for this tool"},
@@ -294,6 +351,27 @@ def build_card(
     """
     evidence = approval.evidence_subset or {}
     preview_text = evidence.get("body_preview") or evidence.get("settings_preview") or ""
+    # WYSIWYE redaction signal: prefer the stored evidence signal;
+    # legacy evidence (created before the signal existed) is
+    # recomputed from the replay body, which still holds the raw
+    # bytes. The signal must never be inferred from the redacted
+    # preview itself — the preview alone cannot tell what it hid.
+    preview_redacted = evidence.get("preview_redacted")
+    preview_redacted_count = evidence.get("preview_redacted_count") or 0
+    if preview_redacted is None:
+        if approval.tool in RAW_BODY_TOOLS:
+            raw_body = str((evidence.get("replay_args") or {}).get("body") or "")
+            _, preview_redacted_count = redact_code_like_secrets_with_count(raw_body)
+            preview_redacted = preview_redacted_count > 0
+        else:
+            preview_redacted = False
+            preview_redacted_count = 0
+    else:
+        preview_redacted = bool(preview_redacted)
+        try:
+            preview_redacted_count = int(preview_redacted_count)
+        except (TypeError, ValueError):
+            preview_redacted_count = 0
     trigger_text = f"{evidence.get('subject') or ''}\n{preview_text}"
     mandate_remaining = None
     if mandate is not None and mandate.expires_at is not None:
@@ -332,6 +410,10 @@ def build_card(
         "audience_hash": evidence.get("audience_hash"),
         "content_hash": evidence.get("content_hash"),
         "content_preview": preview_text,
+        # True when redaction changed the preview: the card shows
+        # redacted text but replay sends the raw body verbatim.
+        "preview_redacted": preview_redacted,
+        "preview_redacted_count": preview_redacted_count,
         "subject": evidence.get("subject"),
         "cap": {"used": cap_used, "total": cap_total,
                 "label": f"{cap_used} of {cap_total} pending approvals used"},
@@ -346,6 +428,11 @@ def render_inert_html(card: dict[str, Any]) -> str:
     Every argument block is wrapped in <pre> with a static
     "untrusted content" badge. URLs render as plain text — this
     renderer never emits <a> tags.
+
+    For the raw-body tools (``RAW_BODY_TOOLS``) whose preview was
+    redacted, a prominent warning section is rendered immediately
+    after the consequence: the preview hides secret(s), but approval
+    sends the original unredacted body verbatim.
     """
     def pre(text: str) -> str:
         return (
@@ -361,6 +448,30 @@ def render_inert_html(card: dict[str, Any]) -> str:
     parts.append(section("Mandate", pre(
         f"purpose: {m['purpose']}\nremaining: {m['remaining']}")))
     parts.append(section("Consequence", pre(card["consequence"])))
+    # WYSIWYE warning: the approver sees the redacted preview, but
+    # replay sends the raw body verbatim. Surface this BEFORE the
+    # preview so approval is never granted on the mistaken belief
+    # that the redacted text is what executes. Only for the
+    # raw-body tools — other tools never replay a redacted body.
+    if card.get("tool") in RAW_BODY_TOOLS and card.get("preview_redacted"):
+        try:
+            _count = int(card.get("preview_redacted_count") or 0)
+        except (TypeError, ValueError):
+            _count = 0
+        if _count > 0:
+            _headline = (
+                f"preview redacted {_count} secrets — "
+                "raw body will be sent verbatim"
+            )
+        else:
+            _headline = "preview redacted secrets — raw body will be sent verbatim"
+        parts.append(section("⚠ WARNING — preview redacted", pre(
+            f"⚠ WARNING: {_headline}\n"
+            "The preview below hides secret(s) that redaction removed. "
+            "Approving sends the ORIGINAL unredacted body exactly as the "
+            "agent submitted it — including the hidden secret(s). "
+            "Do not approve unless the full raw body is safe to send."
+        )))
     terms = card.get("terms") or {}
     parts.append(section("Term sheet (PAA06)", pre("\n".join(
         f"{k}: {v if v is not None else '—'}" for k, v in terms.items()))))
