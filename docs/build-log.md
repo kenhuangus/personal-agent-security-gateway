@@ -1993,3 +1993,76 @@ AC-11 budget; the instrumentation itself does not touch the budget.
   runtime, `repr=False` in Settings); no code copied from other repos
   (adapter written from the OpenAI chat-completions contract).
 
+
+## 2026-10-13 — Batch 2 PR-A: resilience/hardening mediums (GH #7, #8, #9, #11–#18)
+
+Branch `fix/mediums-a` → PR-A against `main`. 11 mediums, all fail-closed.
+
+- **#7 SQLite busy timeout** (`db.py`): `PRAGMA busy_timeout=5000` in
+  `_apply_sqlite_pragmas` — concurrent writers wait instead of instant
+  `database is locked`.
+- **#8 connector exception text** (`pipeline.py` ExecuteStage): agent envelope is
+  now generic `{"tool"}` only; the exception text is logged server-side with the
+  request_id. No path/stack leakage to agents.
+- **#9 pipeline deadline** (`pipeline.py`, `config.py`): `Pipeline.execute` runs
+  under a deadline — daemon worker thread + `contextvars.copy_context()` so the
+  audit trail still works; new setting `pipeline_timeout_seconds`
+  (`GATEWAY_PIPELINE_TIMEOUT_S`, default 120.0, ≤0 disables). Expiry maps to
+  `upstream_failure` with `unknown_outcome`/`retry_blocked`/`deadline_exceeded`
+  details (`halted_at="deadline"`); the block is recorded synchronously on the
+  caller thread through ExecuteStage's unknown-outcome gate.
+- **#11 redaction catalog cache** (`inspection/redaction.py`): compiled patterns
+  cached in-process, invalidated (version bump) on console add/delete/toggle/
+  update; on config-DB error the catalog falls back to the last-known-good set
+  (or seed defaults when nothing was ever loaded) — a config-DB outage no
+  longer takes redaction down with it.
+- **#12 counterparty audit redaction** (`counterparty.py` `correct()`): before/
+  after snapshots are redacted through the catalog before the audit write;
+  keys-only fallback when redaction itself fails. Deliberate: the counterparty
+  `key` is NOT redacted (record identity / audit join key, same role as
+  agent_id).
+- **#13 notifier hardening** (`notifier.py`): `notify_new_request` split into
+  `_notify_inner` + outer `except Exception` (never raises); send-failure catch
+  widened to `Exception`; the cooldown is stamped only after SUCCESSFUL
+  delivery (check-only `_cooldown_ok` + `_stamp_cooldown`) — a failed send no
+  longer silences the next one.
+- **#14 ingress JSON caps** (`inspection/validation.py`, `ValidateInputsStage`):
+  depth ≤ 32, args ≤ 256KiB, iterative `check_json_limits` enforced first; the
+  whole validation block is total — any validator exception → `invalid_input`;
+  `validate_against_schema` catches `SchemaError`.
+- **#15 scanner byte budgets** (`inspection/injection_scan.py`, `output.py`):
+  scanner caps 32KiB/field, 256KiB/call; `ScanResult.truncated_fields` (count,
+  capped at 50 names) recorded into the injection audit event. `redact_value`
+  caps 64KiB/field, 512KiB/call — over-cap tails are replaced with
+  `[redacted:truncated]` (never delivered unredacted) plus a synthetic
+  `_truncated` audit event. BEHAVIOR CHANGE for huge outputs — flagged.
+- **#16 notifier rotation fail-closed** (`notifier.py`, `config.py`): unset or
+  unparseable `GATEWAY_NOTIFIER_SECRET_ISSUED_AT` now → `secret_expired`
+  (fail closed); escape hatch `GATEWAY_NOTIFIER_ALLOW_UNKNOWN_SECRET_AGE=1`.
+- **#17 external OPA bundle verification** (`opa_client.py`): `bundle_fingerprint()`
+  (sha256 over `policies/v1`, excluding `bundle_info.json`);
+  `scripts/pin_bundle_fingerprint.py` pins `bundle_info.json` (verified the
+  OPA server actually serves `data.gateway.bundle.info.fingerprint`); external
+  mode verifies at startup (fail closed, resets `_external_up`) + a daemon
+  watchdog re-verifies every `GATEWAY_OPA_BUNDLE_CHECK_SECONDS` (default 300);
+  `decide()` refuses while `_bundle_ok` is False.
+- **#18 audit write resilience** (`audit.py`): commit retried with backoff
+  (0 / 0.05 / 0.2 / 0.5s), **re-adding the entry after each rollback**
+  (rollback can detach the pending row — caught by test); persistent failure →
+  dead-letter JSONL (`Settings.audit_dead_letter_path`, default
+  `data/audit-dead-letter.jsonl`) + CRITICAL log; `scripts/replay_audit_dead_letter.py`
+  replays idempotently. Audit write never raises for DB errors.
+
+Tests: 35 new in `tests/test_mediums_a.py` (all pass); updated `TestNotifier`
+defaults + fake-OPA bundle-info endpoint for the fail-closed changes.
+Full suite on the branch: 650 passed, 8 skipped (live judge tier skipped by default).
+
+Flags for Ken:
+- GH #10 ("rate-limiter increment atomic") is a medium NOT in the fix-all task
+  list — needs assignment; deliberately untouched.
+- #12: counterparty `key` left unredacted in audit rows (record identity).
+- #15: `redact_value` now truncates huge fields with a `[redacted:truncated]`
+  marker in delivered output.
+- #30 (PR-B): the 69MB OPA binary is in git history (0d41b97) though untracked
+  at HEAD — true removal needs a history rewrite (recommend against).
+- The live kev-0.8b on 127.0.0.1:8009 was left untouched throughout.
