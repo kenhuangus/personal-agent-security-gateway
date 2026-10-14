@@ -833,6 +833,137 @@ class TestContentHashBindsReplayArgs:
 
 
 # ---------------------------------------------------------------------------
+# preview_redacted signal + WYSIWYE card warning (PR #34 HOLD)
+#
+# Regression: the card rendered only the redacted body_preview with
+# no indicator that replay sends the RAW body. An agent could hide a
+# secret in the body, the card would show [redacted:code], and the
+# approver would approve the raw secret being sent.
+# ---------------------------------------------------------------------------
+
+class TestPreviewRedactedWarning:
+    def test_email_send_evidence_marks_redacted_preview(self, ring):
+        body = "Here is the secret: my verification code is 482916."
+        ev = build_evidence_subset(
+            "email.send",
+            {"to": ["a@b.c"], "subject": "s", "body": body},
+            ring,
+        )
+        assert ev["preview_redacted"] is True
+        assert ev["preview_redacted_count"] == 1
+        assert "482916" not in ev["body_preview"]
+        # The raw body still executes — and the hash still binds it.
+        from gateway.approval_card import _content_hash
+
+        assert ev["replay_args"]["body"] == body
+        assert ev["content_hash"] == _content_hash(ev["replay_args"], ring)
+
+    def test_code_pr_open_evidence_marks_redacted_preview(self, ring):
+        body = "Fixes ticket 12345678."
+        ev = build_evidence_subset(
+            "code.pr.open",
+            {"repo": "o/r", "title": "t", "head": "h", "base": "b",
+             "body": body},
+            ring,
+        )
+        assert ev["preview_redacted"] is True
+        assert ev["preview_redacted_count"] == 1
+        assert ev["replay_args"]["body"] == body
+
+    def test_clean_preview_marks_not_redacted(self, ring):
+        ev = build_evidence_subset(
+            "email.send",
+            {"to": ["a@b.c"], "subject": "s",
+             "body": "No secrets here, just a status update."},
+            ring,
+        )
+        assert ev["preview_redacted"] is False
+        assert ev["preview_redacted_count"] == 0
+
+    def test_multiple_secrets_counted(self, ring):
+        ev = build_evidence_subset(
+            "email.send",
+            {"to": ["a@b.c"], "subject": "s",
+             "body": "first code 123456 and second code 654321"},
+            ring,
+        )
+        assert ev["preview_redacted"] is True
+        assert ev["preview_redacted_count"] == 2
+
+    def test_card_warns_when_preview_redacted(
+        self, dbs, settings, ring, registry, agent, config_db
+    ):
+        with dbs.config.session() as cdb:
+            _require_approval_rule(cdb)
+        args = dict(
+            SEND_ARGS,
+            body="Here is the secret: my verification code is 482916.",
+        )
+        outcome, _ = _run(dbs, settings, ring, registry, agent, "email.send", args)
+        apr_id = _approval_required_body(outcome)["approval_request_id"]
+        with dbs.config.session() as cdb:
+            apr = cdb.get(ApprovalRequest, apr_id)
+            assert apr.evidence_subset["preview_redacted"] is True
+            card = build_card(
+                apr, agent_display_name="Muse", mandate=None,
+                cap_used=1, cap_total=5, recorded_criteria=None,
+                destructive=False, now=dt.datetime.now(dt.timezone.utc),
+            )
+            html_out = render_inert_html(card)
+        assert card["preview_redacted"] is True
+        assert card["preview_redacted_count"] == 1
+        # The redacted secret itself never leaks onto the card.
+        assert "482916" not in html_out
+        assert "[redacted:code]" in html_out
+        # …but the approver is warned the raw body will be sent verbatim.
+        assert "preview redacted 1 secrets — raw body will be sent verbatim" in html_out
+
+    def test_card_silent_when_preview_clean(
+        self, dbs, settings, ring, registry, agent, config_db
+    ):
+        with dbs.config.session() as cdb:
+            _require_approval_rule(cdb)
+        outcome, _ = _run(dbs, settings, ring, registry, agent, "email.send", dict(SEND_ARGS))
+        apr_id = _approval_required_body(outcome)["approval_request_id"]
+        with dbs.config.session() as cdb:
+            apr = cdb.get(ApprovalRequest, apr_id)
+            card = build_card(
+                apr, agent_display_name="Muse", mandate=None,
+                cap_used=1, cap_total=5, recorded_criteria=None,
+                destructive=False, now=dt.datetime.now(dt.timezone.utc),
+            )
+            html_out = render_inert_html(card)
+        assert card["preview_redacted"] is False
+        assert "raw body will be sent verbatim" not in html_out
+
+    def test_card_recovers_signal_for_legacy_evidence(
+        self, dbs, settings, ring, registry, agent, config_db
+    ):
+        """Pre-fix evidence rows carry no signal; build_card recomputes
+        it from the replay body so old approvals still warn."""
+        with dbs.config.session() as cdb:
+            _require_approval_rule(cdb)
+        args = dict(
+            SEND_ARGS,
+            body="Here is the secret: my verification code is 482916.",
+        )
+        outcome, _ = _run(dbs, settings, ring, registry, agent, "email.send", args)
+        apr_id = _approval_required_body(outcome)["approval_request_id"]
+        with dbs.config.session() as cdb:
+            apr = cdb.get(ApprovalRequest, apr_id)
+            del apr.evidence_subset["preview_redacted"]
+            del apr.evidence_subset["preview_redacted_count"]
+            card = build_card(
+                apr, agent_display_name="Muse", mandate=None,
+                cap_used=1, cap_total=5, recorded_criteria=None,
+                destructive=False, now=dt.datetime.now(dt.timezone.utc),
+            )
+            html_out = render_inert_html(card)
+        assert card["preview_redacted"] is True
+        assert "preview redacted 1 secrets — raw body will be sent verbatim" in html_out
+
+
+# ---------------------------------------------------------------------------
 # Inert card rendering (MF-6)
 # ---------------------------------------------------------------------------
 
