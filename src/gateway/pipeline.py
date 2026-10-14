@@ -29,6 +29,9 @@ AC-11 (gateway-internal spans; adapter upstream timer subtracted).
 
 from __future__ import annotations
 
+import contextvars
+import logging
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -49,11 +52,14 @@ from .inspection.redaction import RedactionCatalog, redact_ctx_for_audit
 from .inspection.urgency_flags import scan_trigger_content
 from .inspection.validation import (
     canonicalize_args,
+    check_json_limits,
     find_control_chars,
     validate_against_schema,
 )
 from .mandates import MandateService
 from .models import Agent, Mandate
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------
@@ -384,27 +390,49 @@ class ValidateInputsStage:
                     ctx.request_id, "no_allow_rule",
                     f"{ctx.tool}: no such tool", tool=ctx.tool,
                 )
-            # Strict schema validation (RFC 3339 date-time, email,
-            # additionalProperties, per-tool patterns).
-            bad_field = validate_against_schema(
-                descriptor.input_schema, ctx.args
-            )
-            if bad_field is not None:
-                return invalid_input(ctx.request_id, bad_field, tool=ctx.tool)
-            # Injection-oriented constraint: no control characters in
-            # string fields.
-            bad_field = find_control_chars(ctx.args)
-            if bad_field is not None:
-                return invalid_input(ctx.request_id, bad_field, tool=ctx.tool)
-            # Canonicalize in place: stable key order (+ integral-float
-            # normalization) before the HMAC argument hash.
-            ctx.args = canonicalize_args(ctx.args)
-            # False-urgency / deceptive-relationship-claim flags for the
-            # approval card (FR-PAA09-002). Stored on the context; M3's
-            # approval service reads them via
-            # urgency_flags_for_approval_record().
-            with timing_span(ctx, "validate.urgency_scan"):
-                ctx.urgency_flags = scan_trigger_content(ctx.args)
+            # GH #14: ingress bounds FIRST, before any recursive walk
+            # over agent-supplied JSON (walk_strings, canonicalize_args,
+            # the redaction/injection walkers). A bound violation is
+            # invalid_input, never a RecursionError out of the pipeline.
+            limit_violation = check_json_limits(ctx.args)
+            if limit_violation is not None:
+                log.warning(
+                    "ingress bound violated (request_id=%s tool=%s): %s",
+                    ctx.request_id, ctx.tool, limit_violation,
+                )
+                return invalid_input(ctx.request_id, "arguments", tool=ctx.tool)
+            try:
+                # Strict schema validation (RFC 3339 date-time, email,
+                # additionalProperties, per-tool patterns).
+                bad_field = validate_against_schema(
+                    descriptor.input_schema, ctx.args
+                )
+                if bad_field is not None:
+                    return invalid_input(ctx.request_id, bad_field, tool=ctx.tool)
+                # Injection-oriented constraint: no control characters in
+                # string fields.
+                bad_field = find_control_chars(ctx.args)
+                if bad_field is not None:
+                    return invalid_input(ctx.request_id, bad_field, tool=ctx.tool)
+                # Canonicalize in place: stable key order (+ integral-float
+                # normalization) before the HMAC argument hash.
+                ctx.args = canonicalize_args(ctx.args)
+                # False-urgency / deceptive-relationship-claim flags for the
+                # approval card (FR-PAA09-002). Stored on the context; M3's
+                # approval service reads them via
+                # urgency_flags_for_approval_record().
+                with timing_span(ctx, "validate.urgency_scan"):
+                    ctx.urgency_flags = scan_trigger_content(ctx.args)
+            except Exception:  # noqa: BLE001 — GH #14: validators are total
+                # Any validator failure (RecursionError on a pathological
+                # payload that slipped the depth cap, a broken tool
+                # schema, an urgency-scan bug) is invalid_input — never
+                # an unaudited crash out of Pipeline.run.
+                log.exception(
+                    "validator failed (request_id=%s tool=%s); failing closed",
+                    ctx.request_id, ctx.tool,
+                )
+                return invalid_input(ctx.request_id, "arguments", tool=ctx.tool)
         return None
 
 
@@ -576,11 +604,20 @@ class ExecuteStage:
                     {"tool": ctx.tool, "unknown_outcome": True, "retry_blocked": True},
                 )
             except Exception as exc:  # noqa: BLE001 — connector failure must not crash the gateway
+                # GH #8: the exception text stays server-side (upstream
+                # errors routinely embed request IDs, key prefixes, or
+                # PII). The agent gets the generic envelope; the detail
+                # is in the server log keyed by request_id.
+                log.error(
+                    "connector call failed (request_id=%s tool=%s agent=%s): %s: %s",
+                    ctx.request_id, ctx.tool, ctx.agent_id,
+                    type(exc).__name__, exc,
+                )
                 return make_error(
                     "upstream_failure",
                     f"{ctx.tool}: connector call failed",
                     ctx.request_id,
-                    {"tool": ctx.tool, "detail": str(exc)[:200]},
+                    {"tool": ctx.tool},
                 )
         return None
 
@@ -690,6 +727,118 @@ class Pipeline:
         # the approval flow refuses to run then (fail closed).
         if self.hmac_ring is not None:
             ctx.argument_hash = argument_hash(ctx.args, self.hmac_ring)
+        timeout = self._deadline_seconds()
+        if timeout is not None:
+            return self._execute_with_deadline(ctx, timeout)
+        return self._execute_inner(ctx)
+
+    def _deadline_seconds(self) -> Optional[float]:
+        """The configured pipeline deadline, or None when disabled."""
+        try:
+            timeout = float(self.settings.pipeline_timeout_seconds)
+        except (TypeError, ValueError):
+            return None
+        return timeout if timeout > 0 else None
+
+    def _execute_with_deadline(
+        self, ctx: CallContext, timeout: float
+    ) -> "PipelineOutcome":
+        """Run the stage loop on a worker thread bounded by *timeout*.
+
+        GH #9: a hung connector handler must not tie up the caller
+        forever (application-layer DoS). The worker thread is a daemon
+        (one per call — no pool, so a flood of hung calls cannot
+        head-of-line-block healthy ones); it keeps running after the
+        deadline so its terminal audit write still lands if the handler
+        ever returns. Request-scoped contextvars propagate via
+        ``contextvars.copy_context`` (the MCP auth binding lives in one).
+        """
+        box: dict[str, Any] = {}
+        parent_ctx = contextvars.copy_context()
+
+        def _target() -> None:
+            try:
+                box["outcome"] = parent_ctx.run(self._execute_inner, ctx)
+            except Exception:  # noqa: BLE001 — contained; the caller already failed closed
+                log.exception(
+                    "pipeline worker thread failed after deadline "
+                    "(request_id=%s tool=%s)",
+                    ctx.request_id, ctx.tool,
+                )
+
+        worker = threading.Thread(
+            target=_target,
+            daemon=True,
+            name=f"gateway-pipeline-{ctx.request_id}",
+        )
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            # Deadline exceeded: fail closed through the unknown-outcome
+            # gate (FR-PAA06-003) — the same envelope shape as a handler
+            # TimeoutError, so automatic retry stays blocked until the
+            # console resolves the block.
+            self._record_deadline_block(ctx)
+            log.error(
+                "pipeline deadline exceeded (request_id=%s tool=%s agent=%s "
+                "timeout=%.1fs); worker thread left running, unknown-outcome "
+                "block recorded",
+                ctx.request_id, ctx.tool, ctx.agent_id, timeout,
+            )
+            error = make_error(
+                "upstream_failure",
+                f"{ctx.tool}: pipeline deadline exceeded; outcome unknown; "
+                "automatic retry blocked pending console status check",
+                ctx.request_id,
+                {
+                    "tool": ctx.tool,
+                    "unknown_outcome": True,
+                    "retry_blocked": True,
+                    "deadline_exceeded": True,
+                },
+            )
+            ctx.decision = _decision_for_error(error)
+            ctx.deny_reason = error.details.get("reason")
+            if ctx.deny_reason is None and error.code in SAFE_REASONS:
+                ctx.deny_reason = error.code
+            return PipelineOutcome(context=ctx, error=error, halted_at="deadline")
+        outcome = box.get("outcome")
+        if outcome is None:  # unreachable: _target always sets it or logs
+            error = make_error(
+                "upstream_failure",
+                f"{ctx.tool}: pipeline worker lost",
+                ctx.request_id,
+                {"tool": ctx.tool},
+            )
+            return PipelineOutcome(context=ctx, error=error, halted_at="deadline")
+        return outcome
+
+    def _record_deadline_block(self, ctx: CallContext) -> None:
+        """Record the unknown-outcome block synchronously (GH #9).
+
+        Runs on the CALLER thread while its DB session is still open —
+        the worker thread may outlive the session, so the block (the
+        durable retry-stop trace) must not depend on it.
+        """
+        if ctx.argument_hash is None:
+            return
+        for stage in self.stages:
+            gate = getattr(stage, "unknown_outcome", None)
+            if gate is not None:
+                try:
+                    gate.record_block(
+                        ctx.agent_id, ctx.tool, ctx.argument_hash,
+                        f"pipeline deadline exceeded after "
+                        f"{self._deadline_seconds():.1f}s; outcome unknown",
+                    )
+                except Exception:  # noqa: BLE001 — the block is best-effort; the envelope already fails closed
+                    log.exception(
+                        "failed to record unknown-outcome block "
+                        "(request_id=%s)", ctx.request_id,
+                    )
+                return
+
+    def _execute_inner(self, ctx: CallContext) -> "PipelineOutcome":
         error: Optional[GatewayError] = None
         halted_at: Optional[str] = None
         for stage in self.stages:
@@ -831,7 +980,7 @@ def build_m1_pipeline(
     registry = registry if registry is not None else ConnectorRegistry()
     identity = IdentityService(config_db)
     mandates = MandateService(config_db)
-    audit = AuditLog(audit_db)
+    audit = AuditLog(audit_db, dead_letter_path=settings.audit_dead_letter_path)
     # M5 inspection wiring (shared by both builders).
     catalog = RedactionCatalog(config_db)
     rate_limiter = RateLimiter(config_db, settings)
@@ -910,7 +1059,7 @@ def build_pipeline(
     registry = registry if registry is not None else ConnectorRegistry()
     identity = IdentityService(config_db)
     mandates = MandateService(config_db)
-    audit = AuditLog(audit_db)
+    audit = AuditLog(audit_db, dead_letter_path=settings.audit_dead_letter_path)
     # M5 inspection wiring (shared by both builders).
     catalog = RedactionCatalog(config_db)
     rate_limiter = RateLimiter(config_db, settings)
@@ -1015,7 +1164,7 @@ def execute_approved_call(
 
     settings = settings or Settings()
     with config_session_factory() as config_db, audit_session_factory() as audit_db:
-        audit = AuditLog(audit_db)
+        audit = AuditLog(audit_db, dead_letter_path=settings.audit_dead_letter_path)
         catalog = RedactionCatalog(config_db)
         mandates = MandateService(config_db)
         counterparty = CounterpartyService(config_db)

@@ -28,6 +28,13 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return float(raw)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -63,6 +70,16 @@ class Settings:
     # approval (00 §7 param 21).
     grant_ttl_minutes: int = field(default_factory=lambda: _env_int("GATEWAY_GRANT_TTL_MIN", 30))
 
+    # --- pipeline execution deadline (GH #9) ---
+    # Overall bound on one pipeline.execute() call. A hung connector
+    # handler (infinite loop, blocking I/O without its own timeout)
+    # ties up the caller indefinitely; expiry maps to upstream_failure
+    # through the unknown-outcome gate (retries stay blocked until the
+    # console resolves them). 0 or negative disables the deadline.
+    pipeline_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("GATEWAY_PIPELINE_TIMEOUT_S", 120.0)
+    )
+
     # --- rate limits (00 §7 param 4; FR-028) ---
     rate_limit_per_minute: int = field(default_factory=lambda: _env_int("GATEWAY_RATE_PER_MIN", 60))
     rate_limit_per_day: int = field(default_factory=lambda: _env_int("GATEWAY_RATE_PER_DAY", 1000))
@@ -76,6 +93,11 @@ class Settings:
 
     # --- audit retention (00 §7 param 5; NFR-DATA-002) ---
     audit_retention_days: int = field(default_factory=lambda: _env_int("GATEWAY_AUDIT_RETENTION_DAYS", 90))
+    # Dead-letter file for audit rows whose commit failed persistently
+    # (GH #18): JSONL, replayable with scripts/replay_audit_dead_letter.py.
+    audit_dead_letter_path: str = field(
+        default_factory=lambda: _env("GATEWAY_AUDIT_DEAD_LETTER", "data/audit-dead-letter.jsonl")
+    )
 
     # --- approval_status polling budget (02 §2.5: own budget) ---
     approval_status_polls_per_minute: int = field(
@@ -98,6 +120,14 @@ class Settings:
     # send when the secret is older than 90 days (03 §5; T13).
     notifier_secret_issued_at: str = field(
         default_factory=lambda: _env("GATEWAY_NOTIFIER_SECRET_ISSUED_AT", "")
+    )
+    # Escape hatch for the 90-day rotation enforcement (GH #16): when
+    # True, an UNSET or unparseable GATEWAY_NOTIFIER_SECRET_ISSUED_AT
+    # only warns instead of refusing to send. Default False (fail
+    # closed): a deploy that never sets the timestamp gets no rotation
+    # enforcement bypass.
+    notifier_allow_unknown_secret_age: bool = field(
+        default_factory=lambda: _env_bool("GATEWAY_NOTIFIER_ALLOW_UNKNOWN_SECRET_AGE", False)
     )
     # Recipient of the email-to-Ken approval notifications (Ken's address,
     # chosen at deploy). Empty = no email transport configured → the

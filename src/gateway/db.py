@@ -27,6 +27,11 @@ def _apply_sqlite_pragmas(dbapi_conn, _connection_record) -> None:  # noqa: ANN0
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL;")
     cursor.execute("PRAGMA foreign_keys=ON;")
+    # GH #7: WAL allows concurrent readers, but writers still serialize
+    # and the default busy timeout is 0. The hot path writes on every
+    # call (last_seen_at, the terminal audit append, rate counters), so
+    # wait up to 5s on a locked database instead of raising SQLITE_BUSY.
+    cursor.execute("PRAGMA busy_timeout=5000;")
     cursor.close()
 
 

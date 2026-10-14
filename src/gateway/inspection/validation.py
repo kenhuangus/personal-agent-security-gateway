@@ -27,10 +27,11 @@ Every failure names the offending FIELD only — never its value
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 from typing import Any, Optional
 
-from jsonschema import FormatChecker, ValidationError
+from jsonschema import FormatChecker, SchemaError, ValidationError
 from jsonschema import validate as jsonschema_validate
 
 
@@ -88,6 +89,11 @@ def validate_against_schema(schema: dict[str, Any], args: Any) -> Optional[str]:
     Returns the offending field name on failure, ``None`` on success.
     Field naming follows the pipeline's ``_validation_field`` rule:
     the top-level path element, never the value.
+
+    GH #14: total — a ``SchemaError`` (a bad TOOL schema, a server
+    bug) is also a validation failure, never an unhandled crash. The
+    offending "field" is ``"arguments"`` then; the schema problem is
+    logged server-side by the caller.
     """
     try:
         jsonschema_validate(
@@ -97,6 +103,60 @@ def validate_against_schema(schema: dict[str, Any], args: Any) -> Optional[str]:
         )
     except ValidationError as exc:
         return _field_name(exc)
+    except SchemaError:
+        return "arguments"
+    return None
+
+
+# ---------------------------------------------------------------------
+# Ingress bounds: JSON depth + serialized size (GH #14)
+# ---------------------------------------------------------------------
+# The walkers (walk_strings, canonicalize_args, the redaction walkers,
+# the injection scanner) are recursive over agent-supplied JSON, and
+# JSON parses fine at any depth. A deeply nested payload would raise
+# RecursionError out of ValidateInputsStage — before the terminal audit
+# stage, so with no error envelope and no audit row. Enforce these
+# bounds FIRST, iteratively (no recursion), and reject with
+# invalid_input.
+
+#: Maximum nesting depth of agent-supplied arguments.
+MAX_JSON_DEPTH = 32
+
+#: Maximum serialized size of agent-supplied arguments (bytes).
+MAX_ARGS_BYTES = 256 * 1024  # 256 KiB
+
+
+def json_depth(value: Any) -> int:
+    """Nesting depth of a JSON-like value (iterative; never recurses)."""
+    depth = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        node, level = stack.pop()
+        if level > depth:
+            depth = level
+        if isinstance(node, dict):
+            stack.extend((v, level + 1) for v in node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend((v, level + 1) for v in node)
+    return depth
+
+
+def check_json_limits(args: Any) -> Optional[str]:
+    """Return a violation description when *args* exceed ingress bounds.
+
+    None when the payload is within bounds. The description names the
+    bound, never argument values.
+    """
+    depth = json_depth(args)
+    if depth > MAX_JSON_DEPTH:
+        return f"arguments exceed max JSON depth {MAX_JSON_DEPTH} (depth {depth})"
+    try:
+        size = len(json.dumps(args, separators=(",", ":"), default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        # Not JSON-serializable at all: invalid input, not a crash.
+        return "arguments are not JSON-serializable"
+    if size > MAX_ARGS_BYTES:
+        return f"arguments exceed max size {MAX_ARGS_BYTES} bytes ({size} bytes)"
     return None
 
 
