@@ -4,19 +4,26 @@
 #
 # Services:
 #   gateway  the MCP control plane (Streamable HTTP on host :8000)
-#   opa      policy decision point (openpolicyagent/opa — version PINNED to
-#            OPA_VERSION in src/gateway/opa_client.py)
+#   opa      policy decision point (openpolicyagent/opa — version from
+#            third_party/opa/OPA_VERSION, the single source of truth;
+#            export OPA_VERSION=$(cat third_party/opa/OPA_VERSION)
+#            before build/up, or rely on the :-default)
 #   kev      kev-0.8b decision-model server for the opt-in judge cascade
-#            (weights download to the kev-models volume on first boot)
+#            (weights download to the kev-models volume on first boot;
+#            restart: unless-stopped so it survives host reboots)
 #
 # The smoke test (scripts/compose_smoke.sh) must run on a docker host —
 # docker is not installed on the repo's build VM.
 
 services:
   opa:
-    # PINNED: must match OPA_VERSION in src/gateway/opa_client.py
-    # (checksum-verified vendored binary in third_party/opa/).
-    image: openpolicyagent/opa:1.8.0
+    # Version: single source of truth is third_party/opa/OPA_VERSION
+    # (also consumed by src/gateway/opa_client.py and
+    # scripts/verify_opa.sh, which checksum-pins the official release).
+    # Compose does not read the file itself: export
+    # OPA_VERSION=$(cat third_party/opa/OPA_VERSION) before build/up,
+    # or rely on the default below (keep it in sync with the file).
+    image: openpolicyagent/opa:${OPA_VERSION:-1.8.0}
     command: ["run", "--server", "--addr=0.0.0.0:8181", "/policies"]
     volumes:
       # The versioned Rego bundle, read-only. Same directory the gateway
@@ -51,6 +58,11 @@ services:
       start_period: 300s # first boot downloads ~1.8GB of weights
     # NOTE: kev-0.8b needs ~2GB RAM (1.7GB resident on CPU). Give the
     # docker host headroom; see README.
+    # GH #31: restart across host reboots / daemon restarts (the judge
+    # backend must not silently disappear — the gateway fails closed to
+    # JudgeUnavailable, which would quietly drop manipulation-detection
+    # and risk-scoring coverage).
+    restart: unless-stopped
 
   gateway:
     build:
@@ -62,6 +74,12 @@ services:
       kev:
         condition: service_started
     ports:
+      # GH #19: the gateway speaks plain HTTP. Fix A requires per-agent
+      # secrets "over TLS": in production put a TLS-terminating reverse
+      # proxy (or platform ingress with TLS) in front of this port and
+      # set GATEWAY_TLS_TERMINATED=1, otherwise the gateway REFUSES to
+      # start on a non-loopback bind. The one-command demo binds the
+      # loopback default (GATEWAY_HOST=127.0.0.1), which needs no proxy.
       - "8000:8000"
     environment:
       # External OPA (no sidecar subprocess in the gateway container).

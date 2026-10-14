@@ -39,6 +39,7 @@ ERROR_CODES: tuple[str, ...] = (
     "upstream_failure",
     "auth_failed",
     "agent_revoked",
+    "fallback_bearer_expired",
 )
 
 # Safe reason vocabulary for policy_denied (02 §2.7): fixed set, no rule
@@ -81,6 +82,7 @@ _RETRYABLE: dict[str, Any] = {
     "upstream_failure": "see_details",
     "auth_failed": False,
     "agent_revoked": False,
+    "fallback_bearer_expired": "rotate_credential",
 }
 
 

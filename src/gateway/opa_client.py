@@ -46,7 +46,22 @@ import httpx
 log = logging.getLogger(__name__)
 
 #: Pinned OPA release (spike-verified; checksum in third_party/opa/SHA256SUMS).
-OPA_VERSION = "1.8.0"
+#: Single source of truth: third_party/opa/OPA_VERSION (also consumed by
+#: scripts/verify_opa.sh and docker-compose.yml). Falls back to the
+#: last-known version when the file is absent (installed package).
+def _read_opa_version() -> str:
+    try:
+        return (
+            Path(__file__).resolve().parent.parent.parent
+            / "third_party"
+            / "opa"
+            / "OPA_VERSION"
+        ).read_text(encoding="utf-8").strip()
+    except OSError:
+        return "1.8.0"
+
+
+OPA_VERSION = _read_opa_version()
 
 #: Decision endpoint (the contract in policies/v1/authz.rego).
 DECISION_PATH = "/v1/data/gateway/authz/decision"

@@ -21,6 +21,10 @@ from ..mock_oauth import MockOAuthProvider
 class MockOAuthIssuer:
     """``UpstreamTokenIssuer`` backed by ``MockOAuthProvider``."""
 
+    # The mock's local dict IS an introspection endpoint: it models a
+    # provider where "is this token still honored?" is answerable (GH #22).
+    supports_introspection: bool = True
+
     def __init__(self, provider: Optional[MockOAuthProvider] = None) -> None:
         self.provider = provider or MockOAuthProvider()
         # Test seam (issue #2): the credential the minter forwarded on

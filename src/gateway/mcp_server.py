@@ -160,8 +160,13 @@ class GatewayAuthMiddleware(Middleware):
     one credential validation per request).
     """
 
-    def __init__(self, session_factory: Callable[[], Session]) -> None:
+    def __init__(
+        self, session_factory: Callable[[], Session], fallback_bearer_max_days: int = 90
+    ) -> None:
         self._session_factory = session_factory
+        # GH #21: enforced in IdentityService.authenticate(); the default
+        # mirrors Settings.fallback_bearer_max_days.
+        self._fallback_bearer_max_days = fallback_bearer_max_days
 
     def _validate_current_request(self) -> tuple[str, Any]:
         """Parse + validate. Returns (agent_id, AuthResult). Raises
@@ -180,7 +185,7 @@ class GatewayAuthMiddleware(Middleware):
             raise _fail("missing or malformed Authorization header")
         _kind, identifier, secret = parsed
         with self._session_factory() as db:
-            identity = IdentityService(db)
+            identity = IdentityService(db, self._fallback_bearer_max_days)
             agent_id = identity.find_agent_id_by_credential_identifier(identifier)
             if agent_id is None:
                 raise _fail("unknown credential")
@@ -199,6 +204,17 @@ class GatewayAuthMiddleware(Middleware):
                 if code == "agent_canceled":
                     raise AuthFailedError(
                         make_error("agent_canceled", "agent work was canceled", req_id).to_text()
+                    ) from None
+                if code == "fallback_bearer_expired":
+                    # GH #21: distinct code directing the admin to rotate
+                    # the fallback Bearer <redacted> (console agents page).
+                    raise AuthFailedError(
+                        make_error(
+                            "fallback_bearer_expired",
+                            "fallback Bearer <redacted> exceeded max age — "
+                            "rotate it in the admin console",
+                            req_id,
+                        ).to_text()
                     ) from None
                 raise _fail("agent authentication failed") from None
             # Detach so the pipeline can use the identity after close.
@@ -351,7 +367,12 @@ class GatewayApp:
 
         self.mcp = FastMCP(
             "agent-security-gateway",
-            middleware=[GatewayAuthMiddleware(self.databases.config.session)],
+            middleware=[
+                GatewayAuthMiddleware(
+                    self.databases.config.session,
+                    fallback_bearer_max_days=self.settings.fallback_bearer_max_days,
+                )
+            ],
         )
 
         # M3: the agent-visible meta tool (02 §2.5) — registered on both
@@ -432,6 +453,11 @@ class GatewayApp:
 
 def main() -> None:
     settings = load_settings()
+    # GH #19: refuse to bind a non-loopback address with no TLS
+    # termination in front (Fix A requires per-agent secrets over TLS).
+    from .config import check_tls_posture
+
+    check_tls_posture(settings.host, settings)
     gateway = GatewayApp(settings)
     uvicorn.run(
         gateway.http_app(),

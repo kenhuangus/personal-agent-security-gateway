@@ -156,15 +156,16 @@ rule_effect(rule) := e if {
 
 # Traceability for the PAA04 decision snapshot: present only when the
 # ontology shaped the decision (an ontology clause on the deciding
-# rule, or an applicable preference group) — mirroring the Python
-# engine's capture condition exactly.
+# rule, or an applicable preference group) — on allow AND deny effects
+# (GH #25: ontology-driven denies get the entry citation and snapshot
+# too), mirroring the Python engine's capture condition exactly.
 trace_info(rule) := {
 	"ontology_shaped": true,
 	"dimension_group_ids": [g.id | some g in dim_groups_applicable],
 	"preference_group_ids": [g.id | some g in applicable_pref_groups],
 } if {
 	input.ontology_snapshot != null
-	rule_effect(rule) == "allow"
+	rule_effect(rule) in {"allow", "deny"}
 	ontology_shaped(rule)
 } else := {}
 
@@ -622,6 +623,8 @@ rule_problems(rule) := union({
 	problem_constraint_ops(rule),
 	problem_regexes(rule),
 	problem_ontology(rule),
+	problem_time_window(rule),
+	problem_tool_selector(rule),
 })
 
 problem_effect(rule) := {m |
@@ -720,6 +723,69 @@ problem_ontology_requires(rule) := {m |
 	req != null
 	req != "owner_approval"
 	m := sprintf("unknown ontology 'requires' value %v", [req])
+}
+
+# GH #26: a malformed time_window (e.g. "start": "9", "days": ["funday"])
+# silently never matches — fail-closed but undebuggable. Reject the
+# shape at save time, mirroring validate_rule_dict in policy.py.
+problem_time_window(rule) := {m |
+	spec := object.get(rule_conditions(rule), "time_window", null)
+	spec != null
+	not time_window_shape_ok(spec)
+	m := "conditions.time_window: start/end must be HH:MM (24-hour) and days must be weekday names (mon..sun)"
+}
+
+time_window_shape_ok(spec) if {
+	_hhmm_ok(object.get(spec, "start", null))
+	_hhmm_ok(object.get(spec, "end", null))
+	_days_ok(object.get(spec, "days", null))
+}
+
+_hhmm_ok(v) if {
+	v == null
+}
+
+_hhmm_ok(v) if {
+	regex.match(`^([01][0-9]|2[0-3]):[0-5][0-9]$`, v)
+}
+
+_days_ok(days) if {
+	days == null
+}
+
+_days_ok(days) if {
+	is_array(days)
+	every d in days {
+		lower(d) in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+	}
+}
+
+# GH #26: a bare "*" (or misplaced wildcard) tool selector silently
+# never matches — only exact names and "prefix.*" work. Reject at save
+# time, mirroring validate_rule_dict in policy.py.
+problem_tool_selector(rule) := {m |
+	sel := object.get(rule, "tool", null)
+	sel != null
+	not tool_selector_shape_ok(sel)
+	m := sprintf("rule tool selector %v never matches: use an exact tool name or 'prefix.*'", [sel])
+}
+
+tool_selector_shape_ok(sel) if {
+	is_string(sel)
+	not contains(sel, "*")
+}
+
+tool_selector_shape_ok(sel) if {
+	is_string(sel)
+	endswith(sel, "*")
+	startswith(sel, trim_suffix(sel, "*"))
+
+	# The wildcard must be the trailing ".*" with a non-empty,
+	# wildcard-free prefix: "email.*".
+	trimmed := trim_suffix(sel, "*")
+	endswith(trimmed, ".")
+	count(trimmed) > 1
+	not contains(trim_suffix(trimmed, "."), "*")
 }
 
 # Every regex-bearing field, for validity checking at save time.

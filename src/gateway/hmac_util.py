@@ -82,13 +82,23 @@ class HmacKeyRing:
         return f"{kid}:{mac.hexdigest()}"
 
     def matches(self, value: Any, tagged_digest: str) -> bool:
-        """Verify *value* against a stored ``key_id:hexdigest`` tag."""
+        """Verify *value* against a stored ``key_id:hexdigest`` tag.
+
+        Total on untrusted input (GH #27): an unknown key id (retired
+        key removed from the ring, or a malformed/forged ref) returns
+        False instead of raising — callers (``verify_snapshot``,
+        idempotency lookups) treat False as "not verified".
+        """
         try:
             kid, hexpart = tagged_digest.split(":", 1)
         except ValueError:
             return False
+        try:
+            key = self._key(kid)
+        except ValueError:
+            return False
         expected = hmac.new(
-            self._key(kid), canonical_json(value).encode("utf-8"), hashlib.sha256
+            key, canonical_json(value).encode("utf-8"), hashlib.sha256
         ).hexdigest()
         return hmac.compare_digest(expected, hexpart)
 

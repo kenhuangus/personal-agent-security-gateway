@@ -58,6 +58,14 @@ class UpstreamTokenIssuer(Protocol):
     an audit row.
     """
 
+    # GH #22: whether this issuer supports token introspection (a
+    # "is this token still honored?" check). Real OAuth providers
+    # (Google/Microsoft) offer NO introspection endpoint for opaque
+    # access tokens — for them this stays False and the ledger alone
+    # governs validation. The mock issuer (local dict) models an
+    # introspectable provider and sets it True.
+    supports_introspection: bool = False
+
     def issue(
         self, credential: str, agent_id: str, scopes: list[str], ttl_seconds: int
     ) -> tuple[str, float]:
@@ -68,7 +76,8 @@ class UpstreamTokenIssuer(Protocol):
         ...
 
     def validate(self, token_value: str) -> bool:
-        """True if the token is known and unexpired."""
+        """True if the token is known and unexpired. Only consulted when
+        ``supports_introspection`` is True."""
         ...
 
     def expire(self, token_value: str) -> None:
@@ -186,19 +195,35 @@ class VaultTokenMinter(TokenMinter):
     ) -> bool:
         """Adapter-side check before presenting the token upstream.
 
-        True only when the handle was minted here, has not expired, the
-        issuer still honors it, and (when given) the agent/tool binding
-        matches. Rotation does NOT invalidate already-minted tokens:
-        they live out their ≤5-min TTL (graceful expiry, FR-023).
+        Defined production semantics (GH #22): the LEDGER is the
+        authority. True only when the handle was minted here (ledger
+        hit), ``now`` is before the LEDGER's ``expires_at_epoch``, and
+        the agent/tool binding matches (when ``expected_*`` are given).
+
+        The token object's self-asserted ``expires_at_epoch`` is
+        deliberately IGNORED — an adapter constructs that object and
+        could forge the field; only the minted ledger record counts.
+
+        The issuer is consulted ONLY when it supports introspection
+        (``UpstreamTokenIssuer.supports_introspection``): real OAuth
+        providers (Google/Microsoft) offer no access-token introspection
+        endpoint for opaque tokens, so for them the ledger alone
+        governs. The mock issuer (local dict) models an introspectable
+        provider.
+
+        Rotation does NOT invalidate already-minted tokens: they live
+        out their ≤5-min TTL (graceful expiry, FR-023).
         """
         rec = self._ledger.get(_ledger_key(token.raw()))
         if rec is None:
             return False
-        now = time.time()
-        if now >= token.expires_at_epoch or now >= rec.expires_at_epoch:
+        # Ledger expiry is the authority — NOT token.expires_at_epoch.
+        if time.time() >= rec.expires_at_epoch:
             return False
         if expected_agent_id is not None and rec.agent_id != expected_agent_id:
             return False
         if expected_tool is not None and rec.tool != expected_tool:
             return False
-        return self._issuer.validate(token.raw())
+        if getattr(self._issuer, "supports_introspection", False):
+            return self._issuer.validate(token.raw())
+        return True

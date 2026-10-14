@@ -120,6 +120,31 @@ def _current_policy_version(db: Session) -> int:
     return row.version if row is not None else 1
 
 
+def policy_materially_superseded(db: Session, since_version: int) -> bool:
+    """True when a MATERIAL policy version newer than ``since_version``
+    exists (FR-PAA04-003).
+
+    Shared by the grant path (``GrantService._superseded``) and the
+    MF-11 server-side replay (``pipeline.execute_approved_call``, GH #23):
+    both consumption paths of an approval use the same semantics, so a
+    non-material edit (rename, reorder, note) never blocks execution
+    while a material change always does.
+    """
+    current = _current_policy_version(db)
+    if since_version >= current:
+        return False
+    material = db.execute(
+        select(func.count())
+        .select_from(PolicyVersion)
+        .where(
+            PolicyVersion.version > since_version,
+            PolicyVersion.version <= current,
+            PolicyVersion.material_change.is_(True),
+        )
+    ).scalar()
+    return bool(material)
+
+
 class GrantService:
     """One-time grant store + the grant_checker seam implementation."""
 
@@ -266,19 +291,7 @@ class GrantService:
         return res.rowcount or 0
 
     def _superseded(self, grant: Grant, db: Session) -> bool:
-        current = _current_policy_version(db)
-        if grant.policy_version >= current:
-            return False
-        material = db.execute(
-            select(func.count())
-            .select_from(PolicyVersion)
-            .where(
-                PolicyVersion.version > grant.policy_version,
-                PolicyVersion.version <= current,
-                PolicyVersion.material_change.is_(True),
-            )
-        ).scalar()
-        return bool(material)
+        return policy_materially_superseded(db, grant.policy_version)
 
 
 def _mandate_dead_reason(mandate: Optional[Mandate], now: dt.datetime) -> Optional[str]:

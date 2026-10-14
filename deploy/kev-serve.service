@@ -1,0 +1,45 @@
+# kev-0.8b judge model server — systemd unit (GH #31).
+#
+# For bare-metal / VM hosts (non-compose): keeps the judge backend alive
+# across reboots and crashes with restart policy. The gateway fails
+# closed to JudgeUnavailable when the backend is down, so without
+# supervision the manipulation-detection and risk-scoring coverage
+# quietly disappears — the gateway also logs a CRITICAL readiness alert
+# after GATEWAY_JUDGE_ALERT_AFTER_MINUTES (default 5) of continuous
+# unreachability (see src/gateway/judge/health.py).
+#
+# Install (as root, on the host that runs the model):
+#   sudo cp deploy/kev-serve.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now kev-serve.service
+#
+# Adjust User=, WorkingDirectory=, and ExecStart= paths to the host.
+# Model load takes several minutes on CPU: TimeoutStartSec covers it so
+# systemd does not kill the unit while the checkpoint loads.
+# Logs: journalctl -u kev-serve -f
+#
+# NOTE: the repo's build VM currently supervises its local kev-0.8b via
+# cron + ~/workspace/kev-serve/ensure-up.sh (every 10 min); this unit is
+# the template for real hosts and is NOT installed system-wide here.
+
+[Unit]
+Description=kev-0.8b judge model server (gateway judge backend, 127.0.0.1:8009)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hatch
+WorkingDirectory=/home/hatch/workspace/kev-serve
+Environment=KEV_DTYPE=bf16
+Environment=PYTHONUNBUFFERED=1
+# Strip bracketed IPv6 no_proxy entries (same workaround as ensure-up.sh).
+ExecStart=/bin/bash -c 'exec env no_proxy=$(printf "%s" "${no_proxy:-}" | sed "s/,\\[[^]]*\\]//g") NO_PROXY=$(printf "%s" "${NO_PROXY:-}" | sed "s/,\\[[^]]*\\]//g") /home/hatch/workspace/kev-serve/.venv/bin/python -u -m kev.serve --run /home/hatch/workspace/kev-serve/models/kev-0.8b --port 8009 --device cpu'
+Restart=always
+RestartSec=30
+TimeoutStartSec=1200
+# The model is ~1.7GB resident; keep the OOM killer away from neighbors.
+OOMScoreAdjust=-200
+
+[Install]
+WantedBy=default.target

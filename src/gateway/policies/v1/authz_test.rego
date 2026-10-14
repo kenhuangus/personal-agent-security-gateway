@@ -361,6 +361,19 @@ test_dimension_clause_match if {
 	d.ontology_shaped == true
 }
 
+# GH #25: a deny-effect rule with a matching ontology clause is
+# ontology-shaped too — the decision carries the entry citation and
+# snapshot refs for the Python PAA04 capture.
+test_deny_with_ontology_clause_is_shaped if {
+	rules := [{
+		"id": 1, "effect": "deny", "tool": "email.send",
+		"conditions": {"ontology": {"dimension": {"purpose": "work"}}},
+	}]
+	d := decide_input(snap_input(rules, snap_fixture))
+	d.effect == "deny"
+	d.ontology_shaped == true
+}
+
 test_dimension_clause_miss_falls_through if {
 	rules := [{
 		"id": 1, "effect": "allow", "tool": "email.send",
