@@ -25,6 +25,7 @@ import base64
 import datetime as dt
 import json
 import os
+import threading
 
 import pytest
 
@@ -710,6 +711,58 @@ class TestRateLimits:
         limiter = RateLimiter(config_db, settings)
         assert limiter.check(agent.id, "test.echo", "req_1") is None
         assert limiter.check(agent.id, "test.echo", "req_2") is None
+
+
+# ---------------------------------------------------------------------------
+# Rate-limiter atomicity (issue #10)
+# ---------------------------------------------------------------------------
+
+class TestRateLimitAtomicity:
+    def test_concurrent_increments_never_exceed_budget(
+            self, dbs, tmp_path, config_db):
+        """Issue #10: N concurrent increments → exact count, never over budget.
+
+        Each thread uses its own session (sessions are not thread-safe),
+        mirroring concurrent in-flight requests against the same agent.
+        The budget check and the increment are one statement, so exactly
+        ``limit`` callers are admitted and the persisted count is exact —
+        the old read-then-write pattern admitted more than ``limit`` here.
+        """
+        limit, n_threads = 10, 25
+        settings = Settings(
+            config_db_path=str(tmp_path / "config.db"),
+            audit_db_path=str(tmp_path / "audit.db"),
+            hmac_key=HMAC_KEY,
+            rate_limit_per_minute=limit,
+            rate_limit_per_day=100000,
+        )
+        agent, _secret = _register(config_db, "ag_atomic")
+        gate = threading.Barrier(n_threads)
+        results = [None] * n_threads
+
+        def worker(i):
+            gate.wait()  # release all threads together: maximum contention
+            with dbs.config.session() as s:
+                err = RateLimiter(s, settings).check(
+                    agent.id, "test.echo", f"req_{i}")
+                results[i] = err is None
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        admitted = sum(results)
+        assert admitted == limit, (
+            f"budget over-admitted: {admitted} of {n_threads} with limit={limit}")
+        assert n_threads - admitted == n_threads - limit
+        now = dt.datetime.now(dt.timezone.utc)
+        minute_start = now.replace(second=0, microsecond=0)
+        with dbs.config.session() as s:
+            assert RateLimiter(s, settings).count(
+                agent.id, "minute", minute_start) == limit
 
 
 # ---------------------------------------------------------------------------

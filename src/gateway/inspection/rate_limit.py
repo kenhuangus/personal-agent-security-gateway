@@ -18,7 +18,8 @@ from __future__ import annotations
 import datetime as dt
 from typing import Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import Settings
@@ -100,15 +101,8 @@ class RateLimiter:
     ) -> Optional[GatewayError]:
         if limit <= 0:
             return None  # budget disabled by configuration
-        stmt = (
-            select(RateCounter)
-            .where(RateCounter.agent_id == agent_id)
-            .where(RateCounter.window == window)
-            .where(RateCounter.window_start == window_start)
-        )
-        row = self.db.execute(stmt).scalar_one_or_none()
-        current = row.count if row is not None else 0
-        if current >= limit:
+        new_count = self._increment(agent_id, window, window_start, limit)
+        if new_count is None:
             retry_after = _retry_after_seconds(now, window_start, window)
             return make_error(
                 "rate_limited",
@@ -117,16 +111,62 @@ class RateLimiter:
                 request_id,
                 {"retry_after": retry_after, "tool": tool, "window": window},
             )
-        if row is None:
-            row = RateCounter(
+        return None
+
+    def _increment(
+        self,
+        agent_id: str,
+        window: str,
+        window_start: dt.datetime,
+        limit: int,
+    ) -> Optional[int]:
+        """Atomically increment a counter when under budget (issue #10).
+
+        A single conditional ``UPDATE ... SET count = count + 1 ...
+        WHERE count < limit ... RETURNING count``: the budget check and
+        the increment happen in one statement, so concurrent sessions
+        can never interleave a read-read-write-write lost update and
+        admit more than ``limit`` callers. A rejected attempt never
+        consumes budget.
+
+        Row creation on the first attempt of a window is guarded by the
+        ``uq_rate_counter`` unique constraint: the loser of a concurrent
+        INSERT rolls back and retries the atomic UPDATE.
+        """
+        upd = (
+            update(RateCounter)
+            .where(
+                RateCounter.agent_id == agent_id,
+                RateCounter.window == window,
+                RateCounter.window_start == window_start,
+                RateCounter.count < limit,
+            )
+            .values(count=RateCounter.count + 1)
+            .returning(RateCounter.count)
+        )
+        new_count = self.db.execute(upd).scalar_one_or_none()
+        if new_count is not None:
+            self.db.commit()
+            return new_count
+        # No row incremented: the counter row does not exist yet, or the
+        # budget is already exhausted. Insert first (count=1); a
+        # concurrent insert fires the unique constraint → roll back and
+        # retry the atomic UPDATE, which now sees the existing row.
+        self.db.add(
+            RateCounter(
                 agent_id=agent_id, window=window,
                 window_start=window_start, count=1,
             )
-            self.db.add(row)
-        else:
-            row.count += 1
+        )
+        try:
+            self.db.flush()
+        except IntegrityError:
+            self.db.rollback()
+            new_count = self.db.execute(upd).scalar_one_or_none()
+            self.db.commit()
+            return new_count  # None → budget exhausted
         self.db.commit()
-        return None
+        return 1
 
     def _prune(self) -> None:
         """Drop counter rows older than 48h (bounded table growth)."""
