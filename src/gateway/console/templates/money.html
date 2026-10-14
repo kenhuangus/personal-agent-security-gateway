@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}Policies · Money{% endblock %}
+{% block content %}
+<h1>Money <span class="note">· under Policies · money pack</span></h1>
+{% if message %}<p class="flash">{{ message }}</p>{% endif %}
+<p class="note">Money rules are evaluated by the money ladder (never by OPA), are always classified <strong>material</strong>, and are validated on save: block structure, then quorum satisfiability, then the OPA gate.</p>
+
+<h2>Add money rule (builder)</h2>
+<form method="post" action="/policies/money/save">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="filters">
+    <label>Name <input name="name" required size="30"></label>
+    <label>Agent (blank = all) <input name="agent_id" size="20" placeholder="agent/wealth-1"></label>
+  </div>
+  <label>Money block (JSON) <textarea name="money_json" rows="12" spellcheck="false" placeholder='{
+  "per_call_hard_cents": 1000000,
+  "per_call_soft_cents": 50000,
+  "per_day_cents": 250000,
+  "max_payments_per_window": {"n": 3, "minutes": 60},
+  "quorum": 1,
+  "cooldown_after_deny_minutes": 60,
+  "checkpoint_after_days": 30
+}'></textarea></label>
+  <p><label>Change note <input name="change_note" size="60"></label>
+  <button type="submit" class="ok">Validate + save as new version (material)</button></p>
+</form>
+
+<h2>Money rules (current version)</h2>
+<table>
+  <tr><th>#</th><th>Name</th><th>Agent</th><th>Effect</th><th>Money block</th><th>Description</th></tr>
+  {% for r in money_rules %}
+  <tr>
+    <td>{{ loop.index }}</td>
+    <td>{{ r.name }}</td>
+    <td>{{ r.agent_id or "all" }}</td>
+    <td><span class="badge {{ r.effect }}">{{ r.effect }}</span> <span class="note">(nominal — ladder is authoritative)</span></td>
+    <td><code>{{ (r.conditions.money or {}) | tojson }}</code></td>
+    <td>{{ r.description or "" }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="note">No money rules yet. Until one is saved, payment.* falls through to the shipped spending preset (require_approval).</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Counterparty allowlist</h2>
+<table>
+  <tr><th>Payee key</th><th>Label</th><th>Account last-4</th><th>Verification</th><th>Record v</th><th>Notes</th><th></th></tr>
+  {% for c in counterparties %}
+  <tr>
+    <td><code>{{ c.payee_key }}</code></td>
+    <td>{{ c.label }}</td>
+    <td>••••{{ c.account_last4 }}</td>
+    <td><span class="badge {{ c.verification_state }}">{{ c.verification_state }}</span></td>
+    <td>{{ c.record_version }}</td>
+    <td>{{ c.notes or "" }}</td>
+    <td>
+      <form method="post" action="/policies/money/allowlist/verify" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="payee_key" value="{{ c.payee_key }}">
+        <select name="state">
+          {% for s in verification_states %}
+          <option value="{{ s }}"{% if s == c.verification_state %} selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+        <button type="submit">Set</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7" class="note">Allowlist is empty — every payee is new, so every payment asks.</td></tr>
+  {% endfor %}
+</table>
+<h3>Add counterparty</h3>
+<form method="post" action="/policies/money/allowlist/add">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="filters">
+    <label>Payee key <input name="payee_key" required size="30" placeholder="ach:irs:xxxx0000"></label>
+    <label>Account last-4 <input name="account_last4" required size="6" maxlength="4" pattern="[0-9]{4}"></label>
+    <label>Note <input name="note" size="40"></label>
+  </div>
+  <p><button type="submit" class="ok">Add (pending verification)</button>
+  <span class="note">Full account numbers never enter the gateway — last-4 only.</span></p>
+</form>
+
+<h2>Agent budgets</h2>
+<form method="get" action="/policies/money">
+  <label>Agent
+    <select name="agent_id">
+      <option value="">— pick an agent —</option>
+      {% for a in agents %}
+      <option value="{{ a }}"{% if a == selected_agent %} selected{% endif %}>{{ a }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">Show remaining budgets</button>
+</form>
+{% if budgets %}
+<p class="note">Remaining spend, as of now, for <strong>{{ budgets.agent_id }}</strong>. Amounts are rendered from integer cents; deny reasons are never shown here.</p>
+<table>
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td>Spent (last 24h)</td><td>{{ "%.2f"|format(budgets.spent_today_cents / 100) }} USD</td></tr>
+  <tr><td>Spent (last 30d)</td><td>{{ "%.2f"|format(budgets.spent_month_cents / 100) }} USD</td></tr>
+  <tr><td>Payments (last hour)</td><td>{{ budgets.payments_last_hour }}</td></tr>
+  <tr><td>Payments (today)</td><td>{{ budgets.payments_today }}</td></tr>
+  <tr><td>New counterparties (today)</td><td>{{ budgets.new_counterparties_today }}</td></tr>
+</table>
+{% endif %}
+
+<h2>Money ledger (recent)</h2>
+<table>
+  <tr><th>Time</th><th>Agent</th><th>Tool</th><th>Amount</th><th>Payee</th><th>Request</th><th>Dry run</th></tr>
+  {% for r in ledger %}
+  <tr>
+    <td>{{ r.occurred_at }}</td>
+    <td>{{ r.agent_id }}</td>
+    <td>{{ r.tool }}</td>
+    <td>{{ "%.2f"|format(r.amount_cents / 100) }} USD</td>
+    <td><code>{{ r.payee_key }}</code></td>
+    <td><code>{{ r.request_id }}</code></td>
+    <td>{% if r.dry_run %}yes{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7" class="note">No ledger entries yet.</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

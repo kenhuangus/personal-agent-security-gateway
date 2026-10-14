@@ -43,6 +43,7 @@ from ..counterparty import CounterpartyService
 from ..hmac_util import HmacKeyRing
 from ..mandates import MandateService
 from ..models import Agent, ApprovalRequest, DecisionCriteria, Mandate, utcnow
+from .admin_auth import SESSION_COOKIE, session_id_for_token
 from .csrf import CsrfProtector
 
 
@@ -185,6 +186,10 @@ def register_approval_routes(
                     "destructive": a.tool in DESTRUCTIVE_TOOLS,
                     "cap_used": service.pending_count(a.agent_id),
                     "cap_total": deps.settings.approval_queue_cap,
+                    # Quorum column (Pillar 1): progress of distinct
+                    # approvals out of the required quorum.
+                    "quorum_required": getattr(a, "quorum_required", 1) or 1,
+                    "quorum_progress": len((a.approvals or {}).get("slots", [])),
                 }
                 for a in pending
             ]
@@ -272,6 +277,11 @@ def register_approval_routes(
                     apr_id, decision=decision, scope=scope, note=note,
                     confirmation_token=confirmation_token,
                     execute_on_approval=execute_on_approval,
+                    # Distinct-session quorum enforcement: each login's
+                    # session id is recorded in the approval slot.
+                    session_id=session_id_for_token(
+                        request.cookies.get(SESSION_COOKIE)
+                    ),
                 )
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)

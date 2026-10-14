@@ -125,12 +125,70 @@ def main() -> int:
     print(
         f"ac11: {args.sessions} sessions x {args.iters} iters = {n} calls | "
         f"p50 {p50:.2f} ms / p95 {p95:.2f} ms / p99 {p99:.2f} ms "
-        f"(budget p95 <= {BUDGET_MS:.0f} ms)"
+        f"(budget p95 <= {BUDGET_MS:.0f} ms) "
     )
     if p95 > BUDGET_MS:
         print("ac11: FAIL — local p95 exceeds the 100 ms budget")
         return 1
     print("ac11: PASS")
+
+    # Pillar 1: the money ladder at the soft-threshold boundary. Three
+    # indexed aggregate queries + the allowlist lookup, budgeted
+    # inside the same policy-path envelope.
+    return _money_boundary_check(tmp, agent_id, args)
+
+
+def _money_boundary_check(tmp: str, agent_id: str, args) -> int:
+    import datetime as dt
+
+    from gateway.money.allowlist import AllowlistService, STATE_VERIFIED
+    from gateway.money.limits import evaluate, validate_money_block
+    from gateway.models import Agent
+
+    settings = Settings(
+        config_db_path=os.path.join(tmp, "config.db"),
+        audit_db_path=os.path.join(tmp, "audit.db"),
+        hmac_key="ac11-hmac-key-material-32bytes!!",
+        money_enabled=True,
+    )
+    dbs = Databases(settings.config_db_path, settings.audit_db_path)
+    with dbs.config.session() as db:
+        agent = db.get(Agent, agent_id)
+        block = validate_money_block({
+            "per_call_soft_cents": 50_000,
+            "per_call_hard_cents": 1_000_000,
+        })
+        AllowlistService(db).add(
+            payee_key="ach:ac11:xxxx0000", label="AC11",
+            details_snapshot={"account_last4": "0000"},
+            verification_state=STATE_VERIFIED, verified_by="admin")
+        now = dt.datetime.now(dt.timezone.utc)
+        latencies: list[float] = []
+        # At the soft-threshold boundary: just under (allow) and at
+        # (require_approval) — both must stay inside the envelope.
+        for amount_cents in (49_999, 50_000):
+            for _ in range(args.iters):
+                start = time.perf_counter()
+                decision = evaluate(
+                    db=db, agent=agent, tool="payment.initiate",
+                    args={"amount_cents": amount_cents,
+                          "payee_key": "ach:ac11:xxxx0000"},
+                    amount_cents=amount_cents,
+                    payee_key="ach:ac11:xxxx0000",
+                    rule=type("R", (), {"id": 1})(), block=block, now=now)
+                latencies.append((time.perf_counter() - start) * 1000.0)
+        p50 = percentile(latencies, 50)
+        p95 = percentile(latencies, 95)
+        print(
+            f"ac11-money: {len(latencies)} ladder evaluations at the "
+            f"soft boundary | p50 {p50:.2f} ms / p95 {p95:.2f} ms "
+            f"(budget p95 <= {BUDGET_MS:.0f} ms)"
+        )
+        assert decision.decision == "require_approval"  # the boundary case
+        if p95 > BUDGET_MS:
+            print("ac11-money: FAIL — ladder p95 exceeds the 100 ms budget")
+            return 1
+    print("ac11-money: PASS")
     return 0
 
 

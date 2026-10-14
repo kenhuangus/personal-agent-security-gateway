@@ -53,8 +53,8 @@ from .approval_card import (
 from .audit import AuditLog
 from .config import Settings
 from .counterparty import CounterpartyService
-from .errors import GatewayError, ToolHalt, invalid_input, make_error
-from .hmac_util import HmacKeyRing
+from .errors import GatewayError, ToolHalt, invalid_input, make_error, policy_denied
+from .hmac_util import HmacKeyRing, canonical_json
 from .ids import is_valid_id, new_approval_id
 from .judge.counterparty_hook import judge_signals_for_approval_record
 from .judge.risk import judge_risk_for_approval_record
@@ -532,29 +532,44 @@ class ApprovalService:
             if destructive
             else self.settings.approval_window_minutes
         )
-        evidence = build_evidence_subset(ctx.tool, ctx.args, self.ring)
+        # Pillar 1: the money stage builds the evidence inputs on ctx
+        # (threshold ladder card); the money evidence builder consumes
+        # them. Non-money calls keep the exact existing shape.
+        money_context = None
+        if ctx.tool.startswith("payment."):
+            money_context = {
+                "money_state": getattr(ctx, "money_state", None),
+                "money_card": getattr(ctx, "money_card", None),
+                "money_rule_id": getattr(ctx, "money_rule_id", None),
+                "new_counterparty": getattr(ctx, "money_new_counterparty", False),
+                "quorum_required": getattr(ctx, "quorum_required", 1) or 1,
+            }
+        evidence = build_evidence_subset(ctx.tool, ctx.args, self.ring, money=money_context)
         # Counterparty snapshot at creation time (FR-PAA05-003): the
-        # card shows the delta vs the record AS OF the request.
-        assessment = self.counterparty.assess(ctx.tool, ctx.args)
-        evidence["counterparty"] = {
-            "key": assessment.key,
-            "known": assessment.known,
-            "is_new": assessment.is_new,
-            "delta": assessment.delta,
-            "record": (
-                {
-                    "call_count": assessment.record.call_count,
-                    "last_seen_at": _iso(assessment.record.last_seen_at),
-                    "notes": assessment.record.notes,
-                }
-                if assessment.record is not None
-                else None
-            ),
-            # Claim source: the message/document that triggered the call
-            # (FR-PAA05-003). Not captured as structured metadata in
-            # MVP — stated, never invented (FR-PAA05-005).
-            "claim_source": "not provided in MVP",
-        }
+        # card shows the delta vs the record AS OF the request. The
+        # money evidence already carries the allowlist snapshot, so
+        # the generic block is skipped for payment.* (no double source).
+        if not ctx.tool.startswith("payment."):
+            assessment = self.counterparty.assess(ctx.tool, ctx.args)
+            evidence["counterparty"] = {
+                "key": assessment.key,
+                "known": assessment.known,
+                "is_new": assessment.is_new,
+                "delta": assessment.delta,
+                "record": (
+                    {
+                        "call_count": assessment.record.call_count,
+                        "last_seen_at": _iso(assessment.record.last_seen_at),
+                        "notes": assessment.record.notes,
+                    }
+                    if assessment.record is not None
+                    else None
+                ),
+                # Claim source: the message/document that triggered the call
+                # (FR-PAA05-003). Not captured as structured metadata in
+                # MVP — stated, never invented (FR-PAA05-005).
+                "claim_source": "not provided in MVP",
+            }
         # Judge advisory signals (additive; mirrors the
         # urgency_flags_for_approval_record() pattern): the risk
         # assessment and counterparty signals ride on the record so
@@ -565,9 +580,37 @@ class ApprovalService:
             evidence["judge_risk"] = judge_risk
         judge_cp_signals = judge_signals_for_approval_record(ctx)
         if judge_cp_signals is not None:
-            evidence["counterparty"]["judge_signals"] = judge_cp_signals
+            evidence.setdefault("counterparty", {})["judge_signals"] = judge_cp_signals
         if ctx.mandate is None:
             raise RuntimeError("approval requested without a live mandate (unreachable)")
+        # Pillar 1 §2: quorum + evidence freeze at creation.
+        quorum_required = getattr(ctx, "quorum_required", 1) or 1
+        if quorum_required > 1:
+            from .quorum import QuorumError, validate_quorum_satisfiable
+
+            try:
+                validate_quorum_satisfiable(self.db, quorum_required)
+            except QuorumError:
+                # Defense in depth: the console save path validates
+                # first; if an admin was removed after the rule was
+                # saved, fail closed — the call is denied rather than
+                # left in an un-approvable queue.
+                return policy_denied(
+                    ctx.request_id, "no_allow_rule",
+                    f"{ctx.tool}: quorum of {quorum_required} cannot be "
+                    "satisfied — ask the operator to register another admin",
+                    tool=ctx.tool,
+                )
+        payee_key = None
+        allowlist_version = None
+        if ctx.tool.startswith("payment."):
+            from .money.allowlist import AllowlistService
+
+            payee_key = str((ctx.args or {}).get("payee_key") or "") or None
+            if payee_key:
+                allowlist_version = AllowlistService(self.db).record_version_of(
+                    None, payee_key
+                )
         apr = ApprovalRequest(
             id=new_approval_id(),
             agent_id=ctx.agent_id,
@@ -584,6 +627,18 @@ class ApprovalService:
             # card and audit timeline can cite them (PAA04).
             ontology_snapshot_ref=getattr(ctx, "ontology_snapshot_ref", None),
             ontology_ref=getattr(ctx, "ontology_ref", None),
+            # Pillar 1 §2: quorum state + frozen context.
+            quorum_required=quorum_required,
+            approvals=[],
+            evidence_hash=self.ring.digest(canonical_json(evidence)),
+            context_fingerprint={
+                "mandate_status": ctx.mandate.status,
+                "policy_version": ctx.policy_version,
+                "payee_key": payee_key,
+                "counterparty_record_version": allowlist_version,
+                "namespace_id": None,  # pre-namespace (§5 lands the column)
+            },
+            request_type="tool_call",
         )
         self.db.add(apr)
         self.db.commit()
@@ -610,6 +665,11 @@ class ApprovalService:
             "expires_at": _iso(apr.expires_at),
             "tool": ctx.tool,
         }
+        # Pillar 1 §1.7: the agent's poll loop is unchanged; it just
+        # waits longer. "quorum": true tells the agent why.
+        if (getattr(apr, "quorum_required", 1) or 1) > 1:
+            details["quorum"] = True
+            details["quorum_required"] = apr.quorum_required
         # M6 checklist (d): the envelope already supports ontology_ref
         # (no errors.py change needed); copy it when present.
         ontology_ref = getattr(ctx, "ontology_ref", None)
@@ -727,17 +787,37 @@ class ApprovalService:
     def sweep_expired(self, now: Optional[dt.datetime] = None) -> int:
         """Mark lapsed pendings expired. Timeouts record the refusal
         cooldown and increment the denial counter like denies (M3:
-        step 10 covers deny AND timeout)."""
+        step 10 covers deny AND timeout).
+
+        Pillar 1 §2.5: the sweep also runs the quorum context check —
+        a pending/partially_approved quorum request whose mandate went
+        non-live, whose policy changed materially, or whose
+        counterparty record version drifted expires with
+        ``context_changed`` even before its clock runs out.
+        """
+        from .quorum import check_context
+
         now = now or self._clock()
         rows = self.db.execute(
             select(ApprovalRequest).where(
-                ApprovalRequest.status == "pending",
-                ApprovalRequest.expires_at <= now,
+                ApprovalRequest.status.in_(["pending", "partially_approved"]),
             )
         ).scalars().all()
+        expired = 0
         for apr in rows:
+            quorum = getattr(apr, "quorum_required", 1) or 1
+            stale = check_context(self.db, apr, now) if quorum > 1 else None
+            timed_out = (as_utc(apr.expires_at) or apr.expires_at) <= now
+            if stale is None and not timed_out:
+                continue
             apr.status = "expired"
             apr.decided_at = now
+            if stale is not None:
+                slots = apr.approvals or []
+                apr.decided_by = (
+                    ",".join(s["admin_id"] for s in slots) if slots else None
+                )
+                apr.decision_note = "expired: context_changed (stale approval context)"
             self._record_refusal_cooldown(
                 apr.agent_id, apr.tool, apr.argument_hash,
                 (as_utc(apr.expires_at) or apr.expires_at)
@@ -747,14 +827,15 @@ class ApprovalService:
                 agent_id=apr.agent_id,
                 tool=apr.tool,
                 decision="expired",
-                reason="approval_expired",
+                reason="context_changed" if stale is not None else "approval_expired",
                 approval_request_id=apr.id,
                 mandate_id=apr.mandate_id,
                 redacted_args=apr.redacted_args,
             )
-        if rows:
+            expired += 1
+        if expired:
             self.db.commit()
-        return len(rows)
+        return expired
 
     def _record_refusal_cooldown(
         self, agent_id: str, tool: str, argument_hash: str, expires_at: dt.datetime
@@ -790,15 +871,83 @@ class ApprovalService:
         note: str = "",
         confirmation_token: Optional[str] = None,
         execute_on_approval: bool = False,
+        # Pillar 1 §2.2: the admin's login session id (distinct-session
+        # enforcement for quorum). Required for quorum requests; the
+        # single-approver path records it when provided.
+        session_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Approve or deny. Idempotent: a retried POST against an
         already-decided request returns the existing decision, never a
-        second grant (02 §2.6)."""
+        second grant (02 §2.6).
+
+        Pillar 1: when ``apr.quorum_required > 1`` the decision
+        delegates to ``quorum.record_approval`` / ``quorum.record_denial``
+        (distinct approvers, distinct sessions, frozen evidence). The
+        ``quorum == 1`` path keeps the exact existing behavior.
+        """
         now = self._clock()
         self.sweep_expired(now=now)
         apr = self.db.get(ApprovalRequest, apr_id)
         if apr is None:
             raise ValueError(f"unknown approval request {apr_id!r}")
+        if decision not in ("approve", "deny"):
+            raise ValueError("decision must be 'approve' or 'deny'")
+        if scope != GRANT_SCOPE_ONE_TIME:
+            # MVP grants are one-time only; windowed grants deferred
+            # post-MVP (00 §3). Reject anything else loudly.
+            raise ValueError(f"unsupported grant scope {scope!r} (MVP: one_time only)")
+        if (getattr(apr, "quorum_required", 1) or 1) > 1:
+            # Quorum path (Pillar 1 §2): distinct approvers, distinct
+            # sessions, evidence freeze + context check.
+            from .quorum import QuorumError, record_approval, record_denial
+
+            if apr.status not in ("pending", "partially_approved"):
+                return {
+                    "approval_request_id": apr.id,
+                    "status": apr.status,
+                    "already_decided": True,
+                    "decided_at": _iso(apr.decided_at),
+                    "decided_by": apr.decided_by,
+                }
+            if session_id is None:
+                raise ValueError(
+                    "quorum approval requires the admin's session id "
+                    "(distinct-session enforcement)"
+                )
+            try:
+                if decision == "deny":
+                    apr = record_denial(
+                        self.db, self, apr_id, admin_id=admin_id,
+                        session_id=session_id, note=note, now=now,
+                    )
+                else:
+                    if execute_on_approval:
+                        raise ValueError(
+                            "execute-on-approval is disabled for quorum requests"
+                        )
+                    apr = record_approval(
+                        self.db, self, apr_id, admin_id=admin_id,
+                        session_id=session_id, note=note, now=now,
+                    )
+            except QuorumError as exc:
+                raise ValueError(str(exc)) from exc
+            return {
+                "approval_request_id": apr.id,
+                "status": apr.status,
+                "already_decided": False,
+                "decided_at": _iso(apr.decided_at),
+                "decided_by": apr.decided_by,
+                "quorum_progress": f"{len(apr.approvals or [])}/{apr.quorum_required}",
+            }
+        # Execute-on-approval is disabled for payment.* (Pillar 1 §1.1):
+        # replaying redacted args could alter the payee; money calls
+        # use the agent re-invoke path only, where the grant's
+        # argument HMAC binds the exact amount + payee.
+        if execute_on_approval and apr.tool.startswith("payment."):
+            raise ValueError(
+                "execute-on-approval is disabled for payment.* "
+                "(the agent re-invoke path binds the exact amount + payee)"
+            )
         if apr.status != "pending":
             return {
                 "approval_request_id": apr.id,
@@ -807,12 +956,6 @@ class ApprovalService:
                 "decided_at": _iso(apr.decided_at),
                 "decided_by": apr.decided_by,
             }
-        if decision not in ("approve", "deny"):
-            raise ValueError("decision must be 'approve' or 'deny'")
-        if scope != GRANT_SCOPE_ONE_TIME:
-            # MVP grants are one-time only; windowed grants deferred
-            # post-MVP (00 §3). Reject anything else loudly.
-            raise ValueError(f"unsupported grant scope {scope!r} (MVP: one_time only)")
 
         if decision == "deny":
             apr.status = "denied"
@@ -841,6 +984,30 @@ class ApprovalService:
             }
 
         # approve -------------------------------------------------------
+        return self._approve_and_mint(
+            apr, admin_id, scope, note, now,
+            confirmation_token=confirmation_token,
+            execute_on_approval=execute_on_approval,
+        )
+
+    def _approve_and_mint(
+        self,
+        apr: ApprovalRequest,
+        admin_id: str,
+        scope: str,
+        note: str,
+        now: dt.datetime,
+        *,
+        confirmation_token: Optional[str] = None,
+        execute_on_approval: bool = False,
+    ) -> dict[str, Any]:
+        """Mint the one-time grant for an approved request (MF-7).
+
+        Shared by the single-approver path and the quorum path (the
+        quorum path calls this only on the transition to ``approved``;
+        ``partially_approved`` mints nothing — the request is not
+        executable at 1/2).
+        """
         if apr.tool in DESTRUCTIVE_TOOLS:
             # Per-decision confirmation token for destructive scopes
             # (FR-042). Full admin re-auth arrives with M6 (FR-036);

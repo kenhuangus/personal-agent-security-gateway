@@ -45,6 +45,100 @@ from typing import Any, Optional
 from .hmac_util import HmacKeyRing, canonical_json
 from .models import as_utc
 
+
+def format_cents(amount_cents: int) -> str:
+    """Render integer cents as $48,000.00 — never via floats."""
+    sign = "-" if amount_cents < 0 else ""
+    dollars, rem = divmod(abs(int(amount_cents)), 100)
+    return f"{sign}${dollars:,}.{rem:02d}"
+
+
+def build_money_evidence(
+    tool: str, args: dict[str, Any], money: dict[str, Any]
+) -> dict[str, Any]:
+    """Evidence subset for ``payment.*`` (Pillar 1 §1.7).
+
+    Consequence summary first ("Pay $48,000.00 to IRS (verified payee,
+    14 prior payments)" — amount rendered from integer cents, never
+    floats); term sheet (mandate scope, remaining daily/monthly
+    budget, velocity usage); counterparty evidence (verification
+    state, verified-by/at, details snapshot — last-4 only, delta vs
+    snapshot); quorum header; drift note (extension sets it via
+    money["drift_notes"]); judge advisory (flags only).
+    """
+    args = args or {}
+    money = money or {}
+    card = money.get("money_card") or {}
+    amount_cents = int(args.get("amount_cents") or 0)
+    payee_key = str(args.get("payee_key") or "")
+    cp = dict(card.get("counterparty") or {})
+    label = cp.get("label") or payee_key
+    verification = cp.get("verification_state") or "unlisted"
+    prior = card.get("prior_payments")
+    prior_text = f", {prior} prior payment{'s' if prior != 1 else ''}" if prior else ""
+    new_flag = "new counterparty" if money.get("new_counterparty") else ""
+    quorum_required = money.get("quorum_required") or 1
+    consequence = (
+        f"Pay {format_cents(amount_cents)} to {label} "
+        f"({verification} payee{prior_text})"
+    ).strip()
+    if tool == "payment.cancel":
+        consequence = (
+            f"Cancel payment {args.get('payment_id')!r} "
+            "(reversal; always requires approval)"
+        )
+    terms: dict[str, Any] = {
+        "payee": label,
+        "payee_key": payee_key,
+        "amount": format_cents(amount_cents),
+        "currency": args.get("currency") or "USD",
+        "fees": None,
+        "dates": None,
+        "recurring": None,
+        "cancellation": None,
+        "remaining_daily_budget": card.get("remaining_daily"),
+        "remaining_monthly_budget": card.get("remaining_monthly"),
+        "velocity": card.get("velocity_used"),
+        "quorum": (
+            f"{quorum_required} of {quorum_required} distinct approvers"
+            if quorum_required > 1 else "single approver"
+        ),
+        "new_counterparty": new_flag or None,
+        "memo": redact_code_like_secrets(str(args.get("memo") or "")) or None,
+        "dry_run": bool(args.get("dry_run", False)),
+        "note": "synthetic dollars only — the gateway never custodies funds",
+    }
+    return {
+        "tool": tool,
+        "consequence": consequence,
+        "terms": terms,
+        # The money pack's allowlist snapshot (last-4 details only) —
+        # richer than the generic counterparty snapshot, so the card
+        # renders it directly.
+        "counterparty": {
+            "key": payee_key,
+            "listed": cp.get("listed", False),
+            "label": label,
+            "verification_state": verification,
+            "verified_by": cp.get("verified_by"),
+            "verified_at": cp.get("verified_at"),
+            "details_snapshot": cp.get("details_snapshot") or {},
+            "record_version": cp.get("record_version"),
+            "is_new": money.get("new_counterparty", False),
+            "claim_source": "not provided in MVP",
+        },
+        "quorum": {
+            "required": quorum_required,
+            "progress": None,  # filled at render time from apr.approvals
+        },
+        "drift_notes": money.get("drift_notes"),
+        "money_rule_id": money.get("money_rule_id"),
+        # execute-on-approval is disabled for payment.* (the replay
+        # path refuses without a builder): money calls use the agent
+        # re-invoke path only.
+        "replay_args": None,
+    }
+
 # ---------------------------------------------------------------------
 # Code-like secret redaction (FR-PAA02-001) — provisional M3 patterns.
 # ---------------------------------------------------------------------
@@ -158,7 +252,10 @@ def _content_hash(parts: Any, ring: HmacKeyRing) -> str:
     return ring.digest({"content": parts})
 
 
-def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) -> dict[str, Any]:
+def build_evidence_subset(
+    tool: str, args: dict[str, Any], ring: HmacKeyRing,
+    money: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Build the approver-visible evidence subset for *tool*.
 
     Cleartext is LIMITED to recipient/payee, amount/currency, audience,
@@ -166,8 +263,14 @@ def build_evidence_subset(tool: str, args: dict[str, Any], ring: HmacKeyRing) ->
     ``replay_args`` entry carries the structured args the
     execute-on-approval fallback replays server-side, and
     ``content_hash`` is computed over exactly that dict (issue #3).
+
+    ``money`` (Pillar 1): the money stage's evidence inputs for
+    ``payment.*`` tools (money_state/money_card/new_counterparty/
+    quorum_required from the threshold ladder).
     """
     args = args or {}
+    if tool.startswith("payment."):
+        return build_money_evidence(tool, args, money or {})
     if tool == "email.send":
         to = list(args.get("to") or [])
         cc = list(args.get("cc") or [])
@@ -376,7 +479,37 @@ def build_card(
     mandate_remaining = None
     if mandate is not None and mandate.expires_at is not None:
         mandate_remaining = _format_countdown(mandate.expires_at, now)
-    return {
+    # Pillar 1 §2: quorum header for the card.
+    quorum_required = getattr(approval, "quorum_required", 1) or 1
+    slots = list(getattr(approval, "approvals", None) or [])
+    quorum = None
+    if quorum_required > 1:
+        quorum = {
+            "required": quorum_required,
+            "progress": f"{len(slots)} / {quorum_required} approvals",
+            "header": f"Needs {quorum_required} of {quorum_required} distinct approvers.",
+            "slots": [
+                {
+                    "approver_index": s.get("approver_index"),
+                    "admin_id": s.get("admin_id"),
+                    "decided_at": s.get("decided_at"),
+                    "auth_method": s.get("auth_method"),
+                }
+                for s in slots
+            ],
+            "awaiting": quorum_required - len(slots),
+            # The evidence is frozen at request creation: the hash lets
+            # the approver verify they signed exactly this context.
+            "evidence_frozen": bool(getattr(approval, "evidence_hash", None)),
+            "evidence_hash": getattr(approval, "evidence_hash", None),
+            # Delegation chain (no-self-approval on delegated mandates).
+            "delegated": (
+                getattr(mandate, "parent_mandate_id", None) is not None
+                if mandate is not None else False
+            ),
+            "delegated_by": getattr(mandate, "created_by", None) if mandate else None,
+        }
+    card = {
         "approval_request_id": approval.id,
         "agent": {"id": approval.agent_id, "display_name": agent_display_name},
         "tool": approval.tool,
@@ -384,6 +517,7 @@ def build_card(
         "expires_at": (as_utc(approval.expires_at) or approval.expires_at).isoformat(),
         "expiry_countdown": _format_countdown(approval.expires_at, now),
         "destructive": destructive,
+        "quorum": quorum,
         "mandate": {
             "id": approval.mandate_id,
             "purpose": getattr(mandate, "purpose", None),
@@ -419,7 +553,10 @@ def build_card(
                 "label": f"{cap_used} of {cap_total} pending approvals used"},
         "policy_version": approval.policy_version,
         "untrusted_content_label": True,
+        # Pillar 1 §3.5 (extension): drift signals that forced step-up.
+        "drift_notes": evidence.get("drift_notes"),
     }
+    return card
 
 
 def render_inert_html(card: dict[str, Any]) -> str:
@@ -447,6 +584,35 @@ def render_inert_html(card: dict[str, Any]) -> str:
     m = card["mandate"]
     parts.append(section("Mandate", pre(
         f"purpose: {m['purpose']}\nremaining: {m['remaining']}")))
+    # Pillar 1 §2: quorum header (approvals.html renders the same data
+    # in the queue; the inert card carries the frozen-evidence note).
+    quorum = card.get("quorum")
+    if quorum:
+        q_lines = [
+            quorum["header"],
+            f"Progress: {quorum['progress']}",
+        ]
+        for s in quorum["slots"]:
+            q_lines.append(
+                f"approver {s['approver_index']}: {s['admin_id']} "
+                f"at {s['decided_at']} ({s['auth_method']})"
+            )
+        for _ in range(quorum["awaiting"]):
+            q_lines.append("awaiting approver…")
+        if quorum["evidence_frozen"]:
+            q_lines.append(
+                "Evidence frozen at request creation "
+                f"(hash {str(quorum['evidence_hash'])[:16]}…): "
+                "a mandate withdrawal, material policy change, or "
+                "counterparty-record change expires this request "
+                "instead of letting it be signed stale."
+            )
+        if quorum["delegated"]:
+            q_lines.append(
+                f"Delegated mandate (chain: {quorum['delegated_by']} → "
+                "agent): the delegator cannot be an approver."
+            )
+        parts.append(section("Quorum", pre("\n".join(q_lines))))
     parts.append(section("Consequence", pre(card["consequence"])))
     # WYSIWYE warning: the approver sees the redacted preview, but
     # replay sends the raw body verbatim. Surface this BEFORE the
@@ -478,6 +644,18 @@ def render_inert_html(card: dict[str, Any]) -> str:
     cp = card.get("counterparty") or {}
     cp_lines = [f"key: {cp.get('key')}", f"known: {cp.get('known')}",
                 f"new payee: {cp.get('is_new')}"]
+    # Pillar 1 money evidence: allowlist snapshot (last-4 details only).
+    if cp.get("verification_state"):
+        cp_lines.append(f"verification: {cp.get('verification_state')}")
+    if cp.get("verified_by"):
+        cp_lines.append(
+            f"verified by {cp.get('verified_by')} at {cp.get('verified_at')}")
+    if cp.get("details_snapshot"):
+        cp_lines.append(f"details (last-4 only): {cp['details_snapshot']}")
+    if cp.get("record_version"):
+        cp_lines.append(f"allowlist record version: {cp.get('record_version')}")
+    if card.get("drift_notes"):
+        cp_lines.append(f"drift (step-up reason): {card['drift_notes']}")
     if cp.get("delta"):
         cp_lines.append(f"delta vs recorded record: {cp['delta']}")
     if card.get("urgency_flags"):

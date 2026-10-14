@@ -42,6 +42,9 @@ COMMITMENT_ADJACENT_TOOLS: frozenset[str] = frozenset({
     "calendar.create",
     "calendar.delete",
     "code.pr.open",
+    # Pillar 1: payment calls carry a payee_key (account fingerprint).
+    "payment.initiate",
+    "payment.cancel",
 })
 
 
@@ -56,6 +59,15 @@ def extract_payee_key(tool: str, args: dict[str, Any]) -> Optional[str]:
     if tool == "code.pr.open":
         repo = args.get("repo")
         return str(repo).strip().lower() if repo else None
+    if tool == "payment.initiate":
+        # Account fingerprint (e.g. "ach:schwab:xxxx1234"); never the
+        # full account number — the allowlist stores last-4 only.
+        payee = args.get("payee_key")
+        return str(payee).strip().lower() if payee else None
+    if tool == "payment.cancel":
+        # The canceled payment's payee is resolved from the referenced
+        # receipt; pre-execution there is no payee to assess.
+        return None
     return None
 
 
@@ -69,6 +81,8 @@ def snapshot_details(tool: str, args: dict[str, Any]) -> dict[str, Any]:
         }
     if tool == "code.pr.open":
         return {"repo": args.get("repo"), "base": args.get("base")}
+    if tool == "payment.initiate":
+        return {"payee_key": args.get("payee_key"), "currency": args.get("currency")}
     return {}
 
 

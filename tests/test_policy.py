@@ -687,7 +687,7 @@ class TestDryRun:
         result = dry_run(config_db, audit_db, v, window_days=7)
         assert result["corpus"] == "synthetic"
         total = sum(result["counts"].values())
-        assert total == 12  # one hand-written call per tool
+        assert total == 15  # one hand-written call per tool (incl. 3 payment.*)
         assert all(c.get("synthetic") is True for c in result["changed_calls"])
         # email.* matches all six email tools (wildcard = prefix match).
         assert result["counts"]["would_allow"] == 6

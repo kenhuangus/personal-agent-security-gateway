@@ -50,13 +50,21 @@ def journal_mode(engine: Engine) -> str:
 class Database:
     """One engine + session factory. Create two: config and audit."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, name: str = "config") -> None:
         self.path = path
+        # Migration target name ("config" | "audit" | "vault"); selects
+        # which numbered migrations apply (migrations/__init__.py).
+        self.name = name
         self.engine: Engine = make_engine(path)
         self._factory = sessionmaker(bind=self.engine, class_=Session, expire_on_commit=False)
 
     def create_all(self) -> None:
         Base.metadata.create_all(self.engine)
+        # Pillar 1 §9: versioned migrations run at boot (idempotent;
+        # no-op on fresh DBs where create_all already converged).
+        from .migrations import migrate
+
+        migrate(self.engine, self.name)
 
     def session(self) -> Session:
         return self._factory()
@@ -66,8 +74,8 @@ class Databases:
     """The gateway's two databases."""
 
     def __init__(self, config_path: str, audit_path: str) -> None:
-        self.config = Database(config_path)
-        self.audit = Database(audit_path)
+        self.config = Database(config_path, name="config")
+        self.audit = Database(audit_path, name="audit")
 
     def create_all(self) -> None:
         self.config.create_all()
