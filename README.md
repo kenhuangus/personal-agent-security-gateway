@@ -151,6 +151,8 @@ Notes:
 | `GATEWAY_OPA_BUNDLE_CHECK_SECONDS` | `300` | external-OPA bundle fingerprint re-verification interval (GH #17) |
 | `GATEWAY_JUDGE_ALERT_AFTER_MINUTES` | `5` | **JUDGE:** minutes of continuous backend unreachability before the CRITICAL readiness alert (GH #31) |
 | `GATEWAY_JUDGE_BACKEND` | `none` | **JUDGE (opt-in):** judge primary — `none`\|`kev`\|`jev` |
+| `GATEWAY_JUDGE_KEV_URL` | `http://127.0.0.1:8009` | **JUDGE:** kev `/v1/systemone` endpoint |
+| `GATEWAY_JUDGE_KEV_MODEL` | `jaredpalmer/kev-4b` | **JUDGE:** kev model id sent to the endpoint (promotion knob; see `docs/judge-model-runbook.md`) |
 | `GATEWAY_JUDGE_ESCALATION` | `none` | **JUDGE (opt-in):** cascade escalation — `none`\|`jev`\|`llm` (see below) |
 | `GATEWAY_LLM_ESCALATION_URL` | `http://127.0.0.1:11434` | **JUDGE:** OpenAI-compatible chat-completions base (Ollama default; vLLM/SGLang by URL) |
 | `GATEWAY_LLM_ESCALATION_MODEL` | `meta-models/Muse-Glimmer-30B` | **JUDGE:** escalation model id |

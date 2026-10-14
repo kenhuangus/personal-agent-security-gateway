@@ -25,6 +25,7 @@ from .kev import API_KEY_ENV, KevBackend
 # never runs in front of policy evaluation.
 from .cascade import CascadeResult, JudgeCascade, judge_async
 from .counterparty_hook import (
+    JudgeCounterpartyHook,
     judge_counterparty_signals,
     judge_signals_for_approval_record,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "CascadeResult",
     "JudgeCascade",
     "judge_async",
+    "JudgeCounterpartyHook",
     "judge_counterparty_signals",
     "judge_signals_for_approval_record",
     "JudgeInspectionHook",

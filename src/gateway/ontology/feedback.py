@@ -1,5 +1,14 @@
 """Living ontology: the world feeds back into the ontology (PAA04).
 
+STATUS (GH #29): DEFERRED post-MVP — see ``docs/deferred-items.md``
+("ontology feedback loop"). The recording + detection machinery below
+is implemented and unit-tested, but has NO production callers: nothing
+in the pipeline records decision outcomes, nothing runs the detectors,
+and no console surface shows the review queue yet. The enforcement
+hooks and provenance tracking ARE wired (ontology_ctx at policy time,
+snapshots on decisions); the "living/evolving" half stays
+aspirational until the loop is closed per the deferred-items entry.
+
 Decision outcomes (allowed / denied / approved), corrections
 (counterparty-record corrections, mandate narrow/pause/end, redaction-
 catalog edits), and mandate lifecycle events are recorded as immutable

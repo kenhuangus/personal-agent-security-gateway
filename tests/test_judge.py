@@ -476,6 +476,26 @@ class TestFactory:
         s = _settings(monkeypatch, GATEWAY_JUDGE_TIMEOUT_S="0.25")
         assert s.judge_timeout_s == 0.25
 
+    def test_kev_model_selection(self, monkeypatch):
+        """GH #33: the model id is a config knob, passed to the client."""
+        s = _settings(
+            monkeypatch,
+            GATEWAY_JUDGE_BACKEND="kev",
+            GATEWAY_JUDGE_KEV_MODEL="jaredpalmer/kev-0.8b",
+        )
+        assert s.judge_kev_model == "jaredpalmer/kev-0.8b"
+        backend = backend_from_settings(s)
+        assert isinstance(backend, KevBackend)
+        assert backend.model == "jaredpalmer/kev-0.8b"
+
+    def test_kev_model_default_is_4b(self, monkeypatch):
+        """GH #33: default model stays the production recommendation."""
+        monkeypatch.delenv("GATEWAY_JUDGE_KEV_MODEL", raising=False)
+        s = _settings(monkeypatch, GATEWAY_JUDGE_BACKEND="kev")
+        assert s.judge_kev_model == "jaredpalmer/kev-4b"
+        backend = backend_from_settings(s)
+        assert backend.model == "jaredpalmer/kev-4b"
+
     def test_validate_flags_bad_backend(self, monkeypatch):
         s = _settings(monkeypatch, GATEWAY_JUDGE_BACKEND="grok")
         assert any("GATEWAY_JUDGE_BACKEND" in p for p in s.validate())

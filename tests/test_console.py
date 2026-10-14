@@ -628,6 +628,34 @@ class TestVaultSettings:
             assert AuditLog(adb).search(agent_id="admin",
                                         tool="redaction.catalog_update")
 
+    def test_redaction_delete_unknown_pattern_404_and_audited(self, authed, dbs):
+        """GH #28: deleting a nonexistent pattern must 404 (not 500) and
+        the failed attempt must be audit-logged."""
+        client, _secret = authed
+        r = _authed_post(client, "/settings/redaction/delete",
+                         {"name": "no_such_pattern"})
+        assert r.status_code == 404
+        with dbs.audit.session() as adb:
+            rows = AuditLog(adb).search(agent_id="admin",
+                                        tool="redaction.catalog_update",
+                                        decision="denied")
+            assert any((row.redacted_args or {}).get("action") == "delete"
+                       for row in rows)
+
+    def test_redaction_toggle_unknown_pattern_404_and_audited(self, authed, dbs):
+        """GH #28: toggling a nonexistent pattern must 404 (not 500) and
+        the failed attempt must be audit-logged."""
+        client, _secret = authed
+        r = _authed_post(client, "/settings/redaction/toggle",
+                         {"name": "no_such_pattern", "enabled": "false"})
+        assert r.status_code == 404
+        with dbs.audit.session() as adb:
+            rows = AuditLog(adb).search(agent_id="admin",
+                                        tool="redaction.catalog_update",
+                                        decision="denied")
+            assert any((row.redacted_args or {}).get("action") == "toggle"
+                       for row in rows)
+
     def test_decision_criteria_upsert(self, authed, dbs):
         client, _secret = authed
         token = _form_csrf(client)

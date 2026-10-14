@@ -43,6 +43,11 @@ def backend_from_settings(settings) -> DecisionBackend:
         return KevBackend(
             base_url=settings.judge_kev_url,
             api_key=os.environ.get(API_KEY_ENV),
+            # GH #33: model selection is a config knob, not a code change.
+            # getattr keeps the factory working with settings objects that
+            # predate the field (tests, older callers).
+            model=getattr(settings, "judge_kev_model", None)
+            or "jaredpalmer/kev-4b",
         )
     if which == "jev":
         if not settings.judge_jev_url:
