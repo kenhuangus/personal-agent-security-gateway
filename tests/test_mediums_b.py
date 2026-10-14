@@ -308,7 +308,7 @@ class _NoIntrospectionIssuer:
     def __init__(self):
         self._tokens = {}
 
-    def issue(self, agent_id, scopes, ttl_seconds):
+    def issue(self, credential, agent_id, scopes, ttl_seconds):
         import secrets as _secrets
 
         value = "opaque-" + _secrets.token_hex(16)
