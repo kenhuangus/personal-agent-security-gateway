@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .cascade import JudgeCascade
-from .client import Question
+from .client import JudgeUnavailable, Question
 
 #: Max trigger-content chars sent to the judge as state.
 STATE_CHAR_CAP = 6000
@@ -78,6 +78,74 @@ def judge_counterparty_signals(
         signals[name] = {"flagged": flagged, "confidence": round(confidence, 3)}
     signals["escalated"] = result.escalated
     return signals
+
+
+class JudgeCounterpartyHook:
+    """Advisory judge hook installed on ``ValidateInputsStage`` (GH #32).
+
+    Scores the call's trigger content for false-urgency / trusted-party
+    impersonation signals and stores them on ``ctx.judge_counterparty_signals``;
+    the approval service reads them via
+    ``judge_signals_for_approval_record`` and renders them in the
+    counterparty evidence section of the approval card.
+
+    Advisory ONLY: ``check`` never halts validation and never decides —
+    it returns a signals dict or None. On ``JudgeUnavailable`` (or any
+    backend failure) it returns None: the deterministic urgency flags
+    stand unchanged (a deterministic flag stays flagged; an unflagged
+    call stays unflagged). The hook can only annotate, never add or
+    remove friction.
+
+    ``always_on``: consult the judge on every validated call, not just
+    when the deterministic urgency scan already flagged suspicion
+    (``GATEWAY_JUDGE_ALWAYS_ON``) — mirrors the inspection-hook gate.
+    """
+
+    def __init__(
+        self,
+        cascade: JudgeCascade,
+        *,
+        always_on: bool = False,
+        min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    ) -> None:
+        self.cascade = cascade
+        self.always_on = always_on
+        self.min_confidence = min_confidence
+
+    def check(  # noqa: ARG002 — ctx kept for hook-signature symmetry
+        self, ctx: Any, args: Any
+    ) -> Optional[dict[str, Any]]:
+        """Score the call's trigger content; return signals dict or None.
+
+        ``args`` are the raw call arguments (converted to judge state
+        here, mirroring ``JudgeInspectionHook``'s ``_result_to_text``).
+        Returns None when the judge is unavailable or errors — advisory,
+        never breaks the validate path. Never raises.
+        """
+        try:
+            return judge_counterparty_signals(
+                _trigger_text(args),
+                self.cascade,
+                min_confidence=self.min_confidence,
+            )
+        except JudgeUnavailable:
+            return None
+        except Exception:  # noqa: BLE001 — advisory: never break validation
+            return None
+
+
+def _trigger_text(args: Any) -> str:
+    """Best-effort string form of the call arguments for judge state."""
+    if args is None:
+        return ""
+    if isinstance(args, str):
+        return args
+    try:
+        import json as _json
+
+        return _json.dumps(args, default=str)[: STATE_CHAR_CAP * 2]
+    except Exception:  # noqa: BLE001 — never fail state building
+        return str(args)[: STATE_CHAR_CAP * 2]
 
 
 def judge_signals_for_approval_record(ctx: Any) -> Optional[dict[str, Any]]:

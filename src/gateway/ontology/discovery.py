@@ -1,5 +1,13 @@
 """Ontology discovery: bootstrap from observed reality, not hand-authoring.
 
+STATUS (GH #29): DEFERRED post-MVP — see ``docs/deferred-items.md``
+("ontology feedback loop"). The discovery + candidate-confirmation
+machinery below is implemented and unit-tested, but has NO production
+callers: nothing runs ``discover_from_audit`` on a schedule and no
+console surface confirms/rejects candidates yet. Preset-driven
+bootstrap IS wired (``presets.apply_preset``); the continuous-discovery
+half waits on the deferred-items entry.
+
 Two sources:
 (a) connected-account metadata — mailbox / calendar account owners become
     person-principal candidates (plus their data resources);

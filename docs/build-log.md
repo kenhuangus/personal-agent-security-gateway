@@ -1993,3 +1993,95 @@ AC-11 budget; the instrumentation itself does not touch the budget.
   runtime, `repr=False` in Settings); no code copied from other repos
   (adapter written from the OpenAI chat-completions contract).
 
+
+## Fix batch 3 — low-severity production-readiness issues #28, #29, #32, #33 (2026-10-13, fix worker)
+
+Branch `fix/lows`; PR workflow (no merge, no direct push to main).
+All four issues verified against the exact code cited before fixing.
+
+### #28 — Catch ValueError (not KeyError) in the redaction delete/toggle routes
+- Verified: `RedactionCatalog._require` raises `ValueError("unknown redaction
+  pattern ...")`; `delete_pattern`/`set_enabled` both funnel through it.
+  The route's `except KeyError: pass` was dead code (unknown-name delete
+  → unhandled 500, failed attempt never audit-logged); `redaction_toggle`
+  had no handler at all.
+- Fix (`src/gateway/console/pages.py`): both routes now catch
+  `ValueError` → audit-log the failed attempt (`decision="denied"`,
+  `reason="unknown_pattern"`, tool `redaction.catalog_update`) → return
+  404 `HTMLResponse`. Success path unchanged (302 + allowed audit row).
+  Return annotations widened `RedirectResponse` → `Response`.
+- Regression tests (`tests/test_console.py`):
+  `test_redaction_delete_unknown_pattern_404_and_audited`,
+  `test_redaction_toggle_unknown_pattern_404_and_audited`.
+
+### #29 — Ontology feedback loop documented as deferred (not wired)
+- Verified: `record_decision_outcome`, `detect_conflicts`, `sweep_stale`,
+  `discover_from_audit` have zero production callers (tests only).
+- Decision: document as deferred, per the issue's explicit allowance. Rationale
+  recorded in `docs/deferred-items.md`: wiring only the recording half
+  (pipeline → feedback events) with no detector runs and no review-queue
+  surface would grow an unconsumed event log — the loop is deferred as a
+  unit. Enforcement (ontology_ctx at policy time, snapshots, provenance)
+  is unaffected.
+- `docs/deferred-items.md` (new): seam (the five intended call sites),
+  what's missing, why deferring is safe, and "done" acceptance criteria.
+- Module docstrings of `feedback.py`/`discovery.py` carry a STATUS header
+  pointing at the entry. No behavior change.
+
+### #32 — Counterparty judge hook auto-wired into ValidateInputsStage
+- New `JudgeCounterpartyHook` (`src/gateway/judge/counterparty_hook.py`):
+  scores trigger content (false-urgency / impersonation) and returns a
+  signals dict or None. Advisory-only by construction: `check` never
+  raises (JudgeUnavailable + broad except → None) and never halts
+  validation — it only sets `ctx.judge_counterparty_signals`, which the
+  approval service already renders via `judge_signals_for_approval_record`
+  (approvals.py, pre-existing consumer).
+- Wiring (`src/gateway/pipeline.py`): `_judge_wiring` now returns
+  `(inspection_hook, risk_scorer, counterparty_hook)` — all None unless
+  `GATEWAY_JUDGE_ENABLED=1`. Both builders install the hook on
+  `ValidateInputsStage`. Gate mirrors the inspection hook: fires only
+  when the deterministic urgency scan already flagged suspicion, or when
+  `GATEWAY_JUDGE_ALWAYS_ON=1`. Latency discipline: one
+  `validate.judge_counterparty` timing span; hot path byte-identical when
+  disabled (hook is None → gate short-circuits).
+- Tests (`tests/test_judge_cascade.py`, 8 new): fires on deterministic
+  suspicion (signals shape, exactly one judge call, span recorded);
+  gate skips the judge on clean calls; always_on consults on clean calls;
+  JudgeUnavailable → None with deterministic flags intact; generic backend
+  error → None, validation never breaks; no hook → no signals;
+  `_judge_wiring` returns the hook when enabled, `(None, None, None)`
+  when disabled.
+
+### #33 — kev-4B promotion: config knob + runbook (no GPU host here)
+- Verified model-agnosticism: `KevBackend` already takes `model=`; only
+  the factory never passed one (no settings knob existed).
+- `config.py`: new `judge_kev_model` (`GATEWAY_JUDGE_KEV_MODEL`, default
+  `jaredpalmer/kev-4b` = production recommendation; literal kept to avoid
+  a config→judge import cycle). `factory.py`: kev backend now built with
+  `model=settings.judge_kev_model` (getattr fallback for older settings
+  objects). README env table gains `GATEWAY_JUDGE_KEV_MODEL` (+ the
+  previously undocumented `GATEWAY_JUDGE_KEV_URL` row).
+- `docs/judge-model-runbook.md` (new): GPU sizing (~16 GB RAM or CUDA ≥
+  8 GB VRAM), serve command, the four env knobs, and the acceptance
+  criteria (accuracy re-run of the live tier against kev-4B, latency vs
+  the AC-11 100 ms budget on the deploy target) required before closing
+  the issue. Status: documented, pending GPU host. No weights downloaded
+  (impossible on this VM), default model unchanged.
+- Tests (`tests/test_judge.py`): model selection pass-through, default
+  stays kev-4b.
+
+### Test evidence
+- Full suite on branch `fix/lows`: **627 passed, 8 skipped**
+  (2026-10-13; the 8 skips are the opt-in live-model tier). New tests:
+  2 console (#28) + 8 judge-cascade wiring (#32) + 2 factory (#33).
+- Environment: pytest run with `TMPDIR=/home/hatch/workspace/.tmp-pytest`
+  (the 512 MB /tmp tmpfs rule); the pre-existing kev-0.8b server on
+  127.0.0.1:8009 was not disturbed.
+
+### Non-regression / invariants
+- Fix A (auth wall), Fix B (approval flow), Rego decision contract,
+  fail-closed, judge advisory-only: untouched (judge changes are
+  additive, default-off; #28 is console-only).
+- No secrets/API keys in repo or tests; no model weights committed;
+  stealth wording intact (no new OWASP project-status claims).
+- `.github/` untouched (untracked in this tree; not committed).

@@ -363,9 +363,14 @@ class ValidateInputsStage:
         self,
         registry: ConnectorRegistry,
         rate_limiter: Optional[RateLimiter] = None,
+        counterparty_hook: Optional[Any] = None,
     ) -> None:
         self.registry = registry
         self.rate_limiter = rate_limiter
+        # JudgeCounterpartyHook (gateway.judge.counterparty_hook): advisory
+        # urgency/impersonation signals for the approval record (GH #32).
+        # Installed only when GATEWAY_JUDGE_ENABLED=1; None otherwise.
+        self.counterparty_hook = counterparty_hook
 
     def run(self, ctx: CallContext) -> Optional[GatewayError]:
         with timing_span(ctx, "validate_inputs"):
@@ -405,6 +410,19 @@ class ValidateInputsStage:
             # urgency_flags_for_approval_record().
             with timing_span(ctx, "validate.urgency_scan"):
                 ctx.urgency_flags = scan_trigger_content(ctx.args)
+            # Judge counterparty signals (advisory; GH #32): gated exactly
+            # like the inspection hook — only when the deterministic
+            # urgency scan already flagged suspicion, or always_on. The
+            # hook annotates ctx.judge_counterparty_signals for the
+            # approval record; it never halts validation (returns None
+            # here regardless of what the judge said).
+            if self.counterparty_hook is not None and (
+                ctx.urgency_flags or self.counterparty_hook.always_on
+            ):
+                with timing_span(ctx, "validate.judge_counterparty"):
+                    ctx.judge_counterparty_signals = (
+                        self.counterparty_hook.check(ctx, ctx.args)
+                    )
         return None
 
 
@@ -770,21 +788,29 @@ class PipelineOutcome:
 
 def _judge_wiring(
     settings: Settings, judge_cascade: Optional[Any]
-) -> tuple[Optional[Any], Optional[Any]]:
+) -> tuple[Optional[Any], Optional[Any], Optional[Any]]:
     """Build the judge hooks for the pipeline builders.
 
-    Returns ``(inspection_hook, risk_scorer)`` — both None unless
-    ``GATEWAY_JUDGE_ENABLED=1``. When enabled without an explicit
-    cascade, the cascade is built from settings
+    Returns ``(inspection_hook, risk_scorer, counterparty_hook)`` — all
+    None unless ``GATEWAY_JUDGE_ENABLED=1``. When enabled without an
+    explicit cascade, the cascade is built from settings
     (``GATEWAY_JUDGE_BACKEND``; ``"none"`` → DisabledBackend →
     JudgeUnavailable → deterministic fallback everywhere) with the
     escalation backend named by ``GATEWAY_JUDGE_ESCALATION``
     (``"none"`` default → no escalation). Imports are
     lazy: the judge package is untouched when the hooks are off.
+
+    The counterparty hook (GH #32) scores trigger content for
+    false-urgency / impersonation signals at validate time and stores
+    them on ``ctx.judge_counterparty_signals`` — advisory-only, never
+    decides. It fires only when the deterministic urgency scan already
+    flagged suspicion (pre-filter gate, mirroring the inspection hook)
+    or when ``GATEWAY_JUDGE_ALWAYS_ON=1``.
     """
     if not getattr(settings, "judge_enabled", False):
-        return None, None
+        return None, None, None
     from .judge.cascade import JudgeCascade
+    from .judge.counterparty_hook import JudgeCounterpartyHook
     from .judge.factory import backend_from_settings, escalation_from_settings
     from .judge.inspection_hook import JudgeInspectionHook
     from .judge.risk import build_risk_scorer
@@ -797,10 +823,10 @@ def _judge_wiring(
             threshold=0.75,
             timeout_s=getattr(settings, "judge_timeout_s", 2.0),
         )
-    hook = JudgeInspectionHook(
-        cascade, always_on=getattr(settings, "judge_always_on", False)
-    )
-    return hook, build_risk_scorer(settings, cascade)
+    always_on = getattr(settings, "judge_always_on", False)
+    hook = JudgeInspectionHook(cascade, always_on=always_on)
+    counterparty_hook = JudgeCounterpartyHook(cascade, always_on=always_on)
+    return hook, build_risk_scorer(settings, cascade), counterparty_hook
 
 
 def build_m1_pipeline(
@@ -824,8 +850,8 @@ def build_m1_pipeline(
     *minter* replaces the ``StubTokenMinter`` (W3/M4 seam): pass the
     vault-backed ``VaultTokenMinter`` to wire the real layer-2 mint.
     *judge_cascade*: an optional ``gateway.judge.JudgeCascade``; the
-    advisory inspection hook is installed only when
-    ``GATEWAY_JUDGE_ENABLED=1`` (default off).
+    advisory inspection hook and counterparty signals hook are installed
+    only when ``GATEWAY_JUDGE_ENABLED=1`` (default off).
     """
     settings = settings or Settings()
     registry = registry if registry is not None else ConnectorRegistry()
@@ -837,7 +863,7 @@ def build_m1_pipeline(
     rate_limiter = RateLimiter(config_db, settings)
     inspection_config = InspectionConfig()
     # Judge hooks (advisory; default off — see _judge_wiring).
-    judge_hook, _ = _judge_wiring(settings, judge_cascade)
+    judge_hook, _, counterparty_hook = _judge_wiring(settings, judge_cascade)
 
     auth_stage = AuthenticateStage(identity)
     audit_stage = AuditStage(audit)
@@ -847,7 +873,10 @@ def build_m1_pipeline(
 
     stages: list[Stage] = [
         auth_stage,
-        ValidateInputsStage(registry, rate_limiter=rate_limiter),
+        ValidateInputsStage(
+            registry, rate_limiter=rate_limiter,
+            counterparty_hook=counterparty_hook,
+        ),
         MandateStage(mandates),
         PolicyStage(),           # M1: visible default-deny; TODO(M2)
         ApprovalStage(),        # M1: no-op; TODO(M3)
@@ -886,8 +915,9 @@ def build_pipeline(
     are (1) ``policy.PolicyStage`` replaces the default-deny stub, and
     (2) ``ValidateInputsStage`` now runs the M5 hardened validator.
     *judge_cascade*: an optional ``gateway.judge.JudgeCascade``; the
-    advisory inspection hook and intent risk step-up are installed only
-    when ``GATEWAY_JUDGE_ENABLED=1`` (default off).
+    advisory inspection hook, intent risk step-up, and counterparty
+    signals hook are installed only when ``GATEWAY_JUDGE_ENABLED=1``
+    (default off).
     W2 registers connector tools; W3 replaces the token minter.
 
     ``grant_checker`` is the M3 grant-store seam (Fix B, MF-7); None in
@@ -916,7 +946,7 @@ def build_pipeline(
     rate_limiter = RateLimiter(config_db, settings)
     inspection_config = InspectionConfig()
     # Judge hooks (advisory; default off — see _judge_wiring).
-    judge_hook, risk_scorer = _judge_wiring(settings, judge_cascade)
+    judge_hook, risk_scorer, counterparty_hook = _judge_wiring(settings, judge_cascade)
 
     # -- M3 approval wiring -------------------------------------------------
     # Lazy: approvals.py is imported by pipeline clients in orders that
@@ -956,7 +986,10 @@ def build_pipeline(
     audit_stage = AuditStage(audit, counterparty=counterparty_svc)
     stages: list[Stage] = [
         auth_stage,
-        ValidateInputsStage(registry, rate_limiter=rate_limiter),
+        ValidateInputsStage(
+            registry, rate_limiter=rate_limiter,
+            counterparty_hook=counterparty_hook,
+        ),
         MandateStage(mandates),
         RealPolicyStage(
             config_db, grant_checker=grant_checker, hmac_ring=hmac_ring,

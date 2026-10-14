@@ -15,7 +15,7 @@ from importlib.metadata import version as _pkg_version
 from typing import Any, Callable, Optional
 
 from fastapi import Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from sqlalchemy import select
 
 from ..approvals import ApprovalService
@@ -725,11 +725,21 @@ def register_vault_settings(
     def redaction_toggle(
         request: Request, name: str = Form(...), enabled: str = Form("true"),
         csrf_token: str = Form(""),
-    ) -> RedirectResponse:
+    ) -> Response:
         if not csrf.check_request(request.cookies, request.headers, csrf_token):
             return csrf_fail()  # type: ignore[return-value]
         with config_session_factory() as db:
-            RedactionCatalog(db).set_enabled(name, enabled.lower() == "true")
+            try:
+                # set_enabled -> _require raises ValueError on unknown
+                # names (GH #28: the unguarded call could 500).
+                RedactionCatalog(db).set_enabled(name, enabled.lower() == "true")
+            except ValueError as exc:
+                _admin_audit(
+                    audit_session_factory, "redaction.catalog_update",
+                    {"action": "toggle", "name": name, "error": str(exc)},
+                    decision="denied", reason="unknown_pattern",
+                )
+                return HTMLResponse(f"unknown pattern: {exc}", status_code=404)
         _admin_audit(
             audit_session_factory, "redaction.catalog_update",
             {"action": "toggle", "name": name, "enabled": enabled},
@@ -739,14 +749,21 @@ def register_vault_settings(
     @app.post("/settings/redaction/delete")
     def redaction_delete(
         request: Request, name: str = Form(...), csrf_token: str = Form("")
-    ) -> RedirectResponse:
+    ) -> Response:
         if not csrf.check_request(request.cookies, request.headers, csrf_token):
             return csrf_fail()  # type: ignore[return-value]
         with config_session_factory() as db:
             try:
+                # delete_pattern -> _require raises ValueError on unknown
+                # names (GH #28: the old `except KeyError` was dead code).
                 RedactionCatalog(db).delete_pattern(name)
-            except KeyError:
-                pass
+            except ValueError as exc:
+                _admin_audit(
+                    audit_session_factory, "redaction.catalog_update",
+                    {"action": "delete", "name": name, "error": str(exc)},
+                    decision="denied", reason="unknown_pattern",
+                )
+                return HTMLResponse(f"unknown pattern: {exc}", status_code=404)
         _admin_audit(
             audit_session_factory, "redaction.catalog_update",
             {"action": "delete", "name": name},

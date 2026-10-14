@@ -132,6 +132,17 @@ class Settings:
     judge_kev_url: str = field(
         default_factory=lambda: _env("GATEWAY_JUDGE_KEV_URL", "http://127.0.0.1:8009")
     )
+    # Kev model id sent to the /v1/systemone endpoint (GH #33). The
+    # client is model-agnostic (any checkpoint speaking the TypeSafe
+    # contract works); this is the config knob for promotion. Default is
+    # the production recommendation kev-4b (mirrors
+    # gateway.judge.kev.DEFAULT_MODEL; kept as a literal here to avoid a
+    # config -> judge import cycle). Local dev serves kev-0.8b on the
+    # same URL — override this to match when the local server runs the
+    # smaller checkpoint.
+    judge_kev_model: str = field(
+        default_factory=lambda: _env("GATEWAY_JUDGE_KEV_MODEL", "jaredpalmer/kev-4b")
+    )
     judge_jev_url: str = field(default_factory=lambda: _env("GATEWAY_JUDGE_JEV_URL", ""))
     judge_jev_api_key: str = field(
         default_factory=lambda: _env("GATEWAY_JUDGE_JEV_API_KEY", ""), repr=False
