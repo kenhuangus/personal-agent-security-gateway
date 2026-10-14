@@ -90,6 +90,15 @@ _PATTERNS: list[tuple[str, str, re.Pattern]] = [
 _B64_BLOB = re.compile(r"[A-Za-z0-9+/]{100,}={0,2}")
 _B64_MIN_DECODE_BYTES = 48
 
+# GH #15: per-call scan budget. Tool outputs are attacker-influenced
+# and unbounded; without a cap a single pathological output (megabytes
+# of base64-ish text) burns CPU on the synchronous hot path. The
+# scanner sees at most MAX_SCAN_BYTES_PER_FIELD of any one field and
+# MAX_SCAN_BYTES_TOTAL per call; truncation is reported on ScanResult
+# (and from there into the audit event) so the blind spot is visible.
+MAX_SCAN_BYTES_PER_FIELD = 32 * 1024  # 32 KiB
+MAX_SCAN_BYTES_TOTAL = 256 * 1024  # 256 KiB
+
 
 @dataclass
 class InjectionFinding:
@@ -102,14 +111,31 @@ class InjectionFinding:
 @dataclass
 class ScanResult:
     findings: list[InjectionFinding] = field(default_factory=list)
+    #: Fields whose scanned text was cut by the GH #15 byte budget
+    #: (dotted paths; sorted, deduplicated, capped at
+    #: _MAX_TRUNCATED_FIELDS_LISTED — see truncated_field_count for the
+    #: full count). A non-empty list means the scanner did NOT see the
+    #: whole output — the audit event records it.
+    truncated_fields: list[str] = field(default_factory=list)
+    #: Total number of fields cut by the budget (≥ len(truncated_fields)).
+    truncated_field_count: int = 0
 
     @property
     def hit(self) -> bool:
         return bool(self.findings)
 
     @property
+    def truncated(self) -> bool:
+        return self.truncated_field_count > 0
+
+    @property
     def pattern_ids(self) -> list[str]:
         return sorted({f.pattern_id for f in self.findings})
+
+
+#: Cap on the truncated-field names carried on ScanResult (the count is
+#: always exact; the names are a sample for the audit event).
+_MAX_TRUNCATED_FIELDS_LISTED = 50
 
 
 def _field_path(path: tuple) -> str:
@@ -139,15 +165,46 @@ def _b64_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def scan_output(result: Any, tool: str = "") -> ScanResult:  # noqa: ARG001
+def scan_output(
+    result: Any,
+    tool: str = "",  # noqa: ARG001
+    *,
+    max_bytes_per_field: int = MAX_SCAN_BYTES_PER_FIELD,
+    max_bytes_total: int = MAX_SCAN_BYTES_TOTAL,
+) -> ScanResult:
     """Scan a tool OUTPUT for prompt-injection patterns.
 
     Pure function: no I/O, no policy lookup. Returns findings; the
     caller (InspectOutputStage) decides block vs redact and logs.
+
+    GH #15: the scan budget. Each field is scanned up to
+    ``max_bytes_per_field`` chars and the call scans at most
+    ``max_bytes_total`` chars overall. Fields cut by the budget are
+    listed on ``ScanResult.truncated_fields`` — findings' spans are
+    relative to the scanned prefix.
     """
     findings: list[InjectionFinding] = []
+    truncated: set[str] = set()
+    truncated_count = 0
+    bytes_scanned = 0
+
+    def _mark_truncated(field_path: str) -> None:
+        nonlocal truncated_count
+        truncated_count += 1
+        if len(truncated) < _MAX_TRUNCATED_FIELDS_LISTED:
+            truncated.add(field_path)
+
     for path, text in walk_strings(result):
         field_path = _field_path(path) or "result"
+        if bytes_scanned >= max_bytes_total:
+            # Budget exhausted: the remaining fields are unscanned.
+            _mark_truncated(field_path)
+            continue
+        allowance = min(max_bytes_per_field, max_bytes_total - bytes_scanned)
+        if len(text) > allowance:
+            _mark_truncated(field_path)
+            text = text[:allowance]
+        bytes_scanned += len(text)
         for pattern_id, category, rx in _PATTERNS:
             spans = [m.span() for m in rx.finditer(text)]
             if spans:
@@ -169,7 +226,11 @@ def scan_output(result: Any, tool: str = "") -> ScanResult:  # noqa: ARG001
                     spans=b64,
                 )
             )
-    return ScanResult(findings=findings)
+    return ScanResult(
+        findings=findings,
+        truncated_fields=sorted(truncated),
+        truncated_field_count=truncated_count,
+    )
 
 
 def redact_findings(result: Any, scan: ScanResult) -> Any:

@@ -163,7 +163,19 @@ class CounterpartyService:
         audit: Any,  # AuditLog; typed loosely to avoid a cycle
     ) -> CounterpartyRecord:
         """Console review/correction (03 AOQ-12): Ken fixes a record;
-        the change is diffed and audit-logged."""
+        the change is diffed and audit-logged.
+
+        GH #12: the audit row carries the before/after snapshots, which
+        for email.send are raw recipient addresses. They are redacted
+        through the redaction catalog before the audit write
+        (NFR-DATA-001: redacted args ONLY). If redaction itself fails,
+        only the changed KEY names are logged — never raw values.
+
+        The ``key`` field itself is NOT redacted: it is the record's
+        primary identifier (the audit row must identify WHICH record
+        was corrected — the same role agent_id plays in call rows).
+        Only the before/after PII payload is redacted.
+        """
         record = self.get(key)
         if record is None:
             raise ValueError(f"unknown counterparty {key!r}")
@@ -180,11 +192,29 @@ class CounterpartyService:
             redacted_args={
                 "key": key,
                 "corrected_by": admin_id,
-                "before": before,
-                "after": {"notes": notes, "details_snapshot": details},
+                "before": self._redacted_for_audit(before),
+                "after": self._redacted_for_audit(
+                    {"notes": notes, "details_snapshot": details}),
             },
         )
         return record
+
+    def _redacted_for_audit(self, value: dict[str, Any]) -> dict[str, Any]:
+        """Redact a correction snapshot for the audit row (GH #12)."""
+        # Lazy: keeps the top-level import arrow one-way (counterparty
+        # is imported by approvals/pipeline; inspection must not be
+        # pulled in at module import time).
+        from .inspection.redaction import RedactionCatalog, redact_value
+
+        try:
+            catalog = RedactionCatalog(self.db)
+            redacted, _events = redact_value(
+                value, catalog, tool="counterparty.correct", agent_id="admin")
+            return redacted
+        except Exception:  # noqa: BLE001 — redaction must not block the correction
+            keys = sorted(value.get("details_snapshot", {}).keys()) \
+                if isinstance(value, dict) else []
+            return {"_redaction_failed": True, "details_keys": keys}
 
 
 def counterparty_escalator(service: CounterpartyService):

@@ -21,6 +21,7 @@ error path never echo values — only field names.
 from __future__ import annotations
 
 import copy
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -30,6 +31,8 @@ from sqlalchemy.orm import Session
 
 from ..models import RedactionPattern
 from .validation import walk_strings
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
 # Seeded default catalog
@@ -177,6 +180,18 @@ class RedactionCatalog:
         self.db = db
         self._memory: list[CompiledPattern] = []  # session-less overlay
         self._seeded = False
+        # GH #11: compiled-catalog cache. _catalog_version bumps on
+        # every mutation (add/delete/toggle/update); _compiled_cache is
+        # (version, compiled) and _last_good is the last successfully
+        # compiled set — the config-DB-outage fallback.
+        self._catalog_version = 0
+        self._compiled_cache: Optional[tuple[int, list[CompiledPattern]]] = None
+        self._last_good: list[CompiledPattern] = []
+
+    def _bump_version(self) -> None:
+        """Invalidate the compiled cache after a catalog mutation."""
+        self._catalog_version += 1
+        self._compiled_cache = None
 
     # -- seeding --------------------------------------------------------
 
@@ -259,6 +274,7 @@ class RedactionCatalog:
         else:
             self.db.add(RedactionPattern(**row))
             self.db.commit()
+        self._bump_version()
         return row
 
     def set_enabled(self, name: str, enabled: bool) -> dict[str, Any]:
@@ -298,12 +314,27 @@ class RedactionCatalog:
             ).scalar_one()
             self.db.delete(row)
             self.db.commit()
+        self._bump_version()
 
     # -- compiled view for the hot path ----------------------------------
 
     def active_patterns(self, tool: str, agent_id: str) -> list[CompiledPattern]:
-        """Enabled patterns in priority order, scoped to (tool, agent)."""
-        self.ensure_seeded()
+        """Enabled patterns in priority order, scoped to (tool, agent).
+
+        GH #11: the hot path must not depend on the config DB. The
+        compiled set is cached in-process (invalidated on console
+        edits); when the DB is unreachable ``ensure_seeded``/``_rows``
+        failures fall back to the last-known-good compiled set instead
+        of raising (which the old code turned into a full outage via
+        ``injected_output_blocked``).
+        """
+        try:
+            self.ensure_seeded()
+        except Exception:  # noqa: BLE001 — config-DB blip: degrade, don't deny
+            log.warning(
+                "redaction catalog seed check failed; using cached/seed patterns",
+                exc_info=True,
+            )
         compiled = self._compiled()
         return sorted(
             [p for p in compiled if p.applies_to(tool, agent_id)],
@@ -328,12 +359,35 @@ class RedactionCatalog:
         ]
 
     def _compiled(self) -> list[CompiledPattern]:
-        if self.db is None:
-            return [p for p in self._memory if p.enabled]
-        return [
-            _compile_row(r)
-            for r in self._rows() if r["enabled"]
-        ]
+        cached = self._compiled_cache
+        if cached is not None and cached[0] == self._catalog_version:
+            return cached[1]
+        try:
+            if self.db is None:
+                fresh = [p for p in self._memory if p.enabled]
+            else:
+                fresh = [
+                    _compile_row(r)
+                    for r in self._rows() if r["enabled"]
+                ]
+        except Exception:  # noqa: BLE001 — GH #11: config-DB outage
+            if self._last_good:
+                log.warning(
+                    "redaction catalog DB read failed; falling back to "
+                    "last-known-good compiled set (%d patterns)",
+                    len(self._last_good), exc_info=True,
+                )
+                return self._last_good
+            # No cache yet (first boot with the DB down): the seeded
+            # defaults are compiled from code, no DB needed.
+            log.warning(
+                "redaction catalog DB read failed with no cached set; "
+                "using seed defaults", exc_info=True,
+            )
+            return [_compile_seed(p) for p in DEFAULT_PATTERNS]
+        self._last_good = fresh
+        self._compiled_cache = (self._catalog_version, fresh)
+        return fresh
 
     def _require(self, name: str) -> dict[str, Any]:
         row = self.get_pattern(name)
@@ -348,6 +402,7 @@ class RedactionCatalog:
                 if p.name == row["name"] else p
                 for p in self._memory
             ]
+            self._bump_version()
             return
         db_row = self.db.execute(
             select(RedactionPattern).where(RedactionPattern.name == row["name"])
@@ -356,6 +411,7 @@ class RedactionCatalog:
                     "priority", "tools", "agents", "enabled"):
             setattr(db_row, key, row[key])
         self.db.commit()
+        self._bump_version()
 
 
 def _compile_seed(seed: _SeedPattern) -> CompiledPattern:
@@ -402,6 +458,19 @@ class RedactionEvent:
     token: str        # replacement token, e.g. "[redacted:phone]"
     field: str        # top-level field path (never the matched value)
     count: int = 1
+
+
+#: GH #15: redaction byte budget — the same DoS class as the injection
+#: scanner (attacker-influenced, unbounded outputs on the hot path).
+#: Fields are redacted up to MAX_REDACT_BYTES_PER_FIELD chars; the
+#: call redacts at most MAX_REDACT_BYTES_TOTAL chars overall. Text past
+#: the budget is NOT delivered unredacted: it is replaced with
+#: TRUNCATED_TOKEN (fail-closed for PII — the PII guarantee
+#: (NFR-DATA-001) outranks output completeness), and a synthetic
+#: RedactionEvent (pattern "_truncated") records it for the audit log.
+MAX_REDACT_BYTES_PER_FIELD = 64 * 1024  # 64 KiB
+MAX_REDACT_BYTES_TOTAL = 512 * 1024  # 512 KiB
+TRUNCATED_TOKEN = "[redacted:truncated]"
 
 
 def redact_text(
@@ -451,23 +520,53 @@ def redact_value(
     catalog: RedactionCatalog,
     tool: str,
     agent_id: str,
+    *,
+    max_bytes_per_field: int = MAX_REDACT_BYTES_PER_FIELD,
+    max_bytes_total: int = MAX_REDACT_BYTES_TOTAL,
 ) -> tuple[Any, list[RedactionEvent]]:
     """Recursively redact strings in a JSON-like value.
 
     Returns (redacted_value, events). Event ``field`` is the top-level
     field path — matched secrets never appear in events.
+
+    GH #15: byte budget. Each string field is redacted up to
+    ``max_bytes_per_field`` chars; the call redacts at most
+    ``max_bytes_total`` chars. Text beyond the budget is replaced with
+    ``[redacted:truncated]`` (never delivered unredacted) and reported
+    as a ``_truncated`` event.
     """
     patterns = catalog.active_patterns(tool, agent_id)
     if not patterns:
         return value, []
 
+    collected: list[RedactionEvent] = []
+    budget = [max_bytes_total]  # mutable cell for the closure
+
     def _redact(node: Any, path: tuple) -> Any:
         if isinstance(node, str):
-            new_text, events = redact_text(node, patterns)
             top = str(path[0]) if path else "result"
+            allowance = min(max_bytes_per_field, budget[0])
+            if allowance <= 0:
+                collected.append(RedactionEvent(
+                    pattern="_truncated", token=TRUNCATED_TOKEN,
+                    field=top, count=1))
+                return TRUNCATED_TOKEN
+            if len(node) > allowance:
+                head = node[:allowance]
+                new_head, events = redact_text(head, patterns)
+                for event in events:
+                    event.field = top
+                    collected.append(event)
+                collected.append(RedactionEvent(
+                    pattern="_truncated", token=TRUNCATED_TOKEN,
+                    field=top, count=1))
+                budget[0] -= allowance
+                return new_head + TRUNCATED_TOKEN
+            new_text, events = redact_text(node, patterns)
             for event in events:
                 event.field = top
                 collected.append(event)
+            budget[0] -= len(node)
             return new_text
         if isinstance(node, dict):
             return {k: _redact(v, path + (str(k),)) for k, v in node.items()}
@@ -477,7 +576,6 @@ def redact_value(
             return tuple(_redact(v, path + (i,)) for i, v in enumerate(node))
         return node
 
-    collected: list[RedactionEvent] = []
     return _redact(value, ()), collected
 
 

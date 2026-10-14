@@ -27,6 +27,7 @@ transports).
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import logging
@@ -49,6 +50,16 @@ OPA_VERSION = "1.8.0"
 
 #: Decision endpoint (the contract in policies/v1/authz.rego).
 DECISION_PATH = "/v1/data/gateway/authz/decision"
+
+#: Bundle-identity endpoint. The pinned bundle ships
+#: policies/v1/bundle_info.json (written by
+#: scripts/pin_bundle_fingerprint.py); OPA serves it as
+#: data.gateway.bundle.info.
+BUNDLE_INFO_PATH = "/v1/data/gateway/bundle/info"
+
+#: Name of the fingerprint file inside the bundle (excluded from the
+#: fingerprint itself — it carries the fingerprint).
+BUNDLE_INFO_NAME = "bundle_info.json"
 
 #: Effects the sidecar may return.
 EFFECTS: tuple[str, ...] = ("allow", "deny", "ask")
@@ -93,6 +104,29 @@ def resolve_binary(explicit: Optional[str] = None) -> Path:
 def default_policies_dir() -> Path:
     """The versioned Rego policy directory served by the sidecar."""
     return Path(__file__).resolve().parent / "policies" / "v1"
+
+
+def bundle_fingerprint(policies_dir: Optional[Path] = None) -> str:
+    """Content fingerprint (hex SHA-256) of the pinned policy bundle.
+
+    Covers every file under policies/v1 (sorted by relative path),
+    EXCEPT bundle_info.json itself — that file carries the fingerprint
+    (written by scripts/pin_bundle_fingerprint.py), so hashing it
+    would be circular. Deterministic across checkouts: same bundle →
+    same fingerprint.
+    """
+    root = Path(policies_dir) if policies_dir is not None else default_policies_dir()
+    digest = hashlib.sha256()
+    files = sorted(
+        (p for p in root.rglob("*") if p.is_file() and p.name != BUNDLE_INFO_NAME),
+        key=lambda p: p.relative_to(root).as_posix(),
+    )
+    for path in files:
+        rel = path.relative_to(root).as_posix()
+        digest.update(rel.encode("utf-8") + b"\x00")
+        digest.update(path.read_bytes())
+        digest.update(b"\x00")
+    return digest.hexdigest()
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -176,6 +210,14 @@ class OpaClient:
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._http: Optional[httpx.Client] = None
+        # GH #17: external-bundle verification state. _bundle_ok flips
+        # False when the periodic re-check fails; decide() refuses to
+        # serve then (fail closed) until the bundle verifies again.
+        self._bundle_ok = True
+        self._bundle_watchdog: Optional[threading.Thread] = None
+        self._bundle_check_seconds = float(
+            os.environ.get("GATEWAY_OPA_BUNDLE_CHECK_SECONDS", "300") or 0
+        )
 
     # -- lifecycle ----------------------------------------------------
 
@@ -254,6 +296,11 @@ class OpaClient:
         the first success, per-decide liveness is the POST itself: any
         transport failure in decide() raises OpaUnavailable and the
         policy engine denies.
+
+        GH #17: the pinned bundle is verified BEFORE the client is
+        marked up — a misconfigured URL, a stale bundle after a bad
+        rollout, or a redirected endpoint must not silently enforce the
+        wrong policy. A periodic watchdog re-verifies afterwards.
         """
         url = self.external_url
         assert url is not None
@@ -278,15 +325,122 @@ class OpaClient:
                             trust_env=False,
                         )
                         self._external_up = True
-                        return
+                        break
                     last = f"HTTP {r.status_code}"
                 except Exception as exc:  # noqa: BLE001 — not ready yet
                     last = str(exc)[:200]
                 time.sleep(0.5)
-        raise OpaUnavailable(
-            f"external OPA at {url} not ready after "
-            f"{self.startup_timeout}s: {last}"
-        )
+            else:
+                raise OpaUnavailable(
+                    f"external OPA at {url} not ready after "
+                    f"{self.startup_timeout}s: {last}"
+                )
+        # GH #17: verify the pinned bundle before serving decisions.
+        # A verification failure must not leave the client marked up:
+        # reset _external_up so running/decide() stay fail-closed.
+        try:
+            self.verify_external_bundle()
+        except OpaUnavailable:
+            self._external_up = False
+            if self._http is not None:
+                try:
+                    self._http.close()
+                except Exception:  # noqa: BLE001 — best-effort
+                    pass
+                self._http = None
+            raise
+        self._start_bundle_watchdog_locked()
+
+    @property
+    def bundle_ok(self) -> bool:
+        """Whether the external bundle last verified (GH #17).
+
+        Always True in sidecar mode (the sidecar serves the local
+        pinned bundle itself).
+        """
+        return self._bundle_ok
+
+    def verify_external_bundle(self) -> str:
+        """Verify the external OPA serves the pinned policy bundle.
+
+        Fetches ``data.gateway.bundle.info`` from the external server
+        and compares its fingerprint against the local policies/v1
+        content fingerprint. Returns the verified fingerprint.
+
+        Raises OpaUnavailable on any mismatch, missing document, or
+        transport failure — the caller fails closed (deny), never
+        serves decisions from an unverified bundle.
+        """
+        if not self._external:
+            return bundle_fingerprint(self.policies_dir)
+        url = self.external_url
+        assert url is not None
+        expected = bundle_fingerprint(self.policies_dir)
+        try:
+            with httpx.Client(timeout=self.request_timeout, trust_env=False) as cli:
+                resp = cli.get(f"{url}{BUNDLE_INFO_PATH}")
+        except Exception as exc:  # noqa: BLE001 — any transport failure is fail-closed
+            raise OpaUnavailable(
+                f"OPA bundle verification failed: {exc}"
+            ) from exc
+        served: Optional[str] = None
+        if 200 <= resp.status_code < 300:
+            try:
+                served = resp.json().get("result", {}).get("fingerprint")
+            except ValueError:
+                served = None
+        if served != expected:
+            raise OpaUnavailable(
+                "OPA bundle fingerprint mismatch: external OPA at "
+                f"{url} serves fingerprint {served!r}, pinned bundle is "
+                f"{expected[:16]}… — refusing to serve decisions "
+                "(stale bundle, misconfigured URL, or redirected endpoint)"
+            )
+        log.info(
+            "external OPA bundle verified (fingerprint %s…)", expected[:16])
+        self._bundle_ok = True
+        return expected
+
+    def _start_bundle_watchdog_locked(self) -> None:
+        """Periodic bundle re-verification (GH #17; caller holds the lock).
+
+        A daemon thread re-checks the fingerprint every
+        GATEWAY_OPA_BUNDLE_CHECK_SECONDS (default 300; <=0 disables).
+        On failure _bundle_ok flips False and decide() refuses to serve
+        until the bundle verifies again; the flip is logged CRITICAL
+        (the alert the deploy's log monitor keys on).
+        """
+        if self._bundle_watchdog is not None:
+            return
+        interval = self._bundle_check_seconds
+        if interval <= 0:
+            log.info("OPA bundle watchdog disabled (GATEWAY_OPA_BUNDLE_CHECK_SECONDS<=0)")
+            return
+
+        def _watch() -> None:
+            while True:
+                time.sleep(interval)
+                if not self._external_up:
+                    continue  # stopped; stay quiet
+                try:
+                    self.verify_external_bundle()
+                except OpaUnavailable as exc:
+                    if self._bundle_ok:
+                        log.critical(
+                            "OPA bundle verification FAILED: %s — refusing "
+                            "further decisions until the pinned bundle "
+                            "verifies again", exc,
+                        )
+                    self._bundle_ok = False
+                except Exception:  # noqa: BLE001 — watchdog never dies loudly
+                    log.exception("OPA bundle watchdog error")
+
+        thread = threading.Thread(
+            target=_watch, daemon=True, name="opa-bundle-watchdog")
+        thread.start()
+        self._bundle_watchdog = thread
+        log.info(
+            "OPA bundle watchdog started (re-verify every %.0fs)", interval)
 
     def _wait_ready(self) -> None:
         deadline = time.monotonic() + self.startup_timeout
@@ -379,8 +533,17 @@ class OpaClient:
         Raises OpaUnavailable on any transport, timeout, HTTP, or
         protocol failure, or when the decision is malformed — the
         caller fails closed (deny).
+
+        GH #17: in external mode, also raises when the periodic bundle
+        re-verification has failed — decisions are refused until the
+        pinned bundle verifies again.
         """
         self.ensure_running()
+        if self._external and not self._bundle_ok:
+            raise OpaUnavailable(
+                "external OPA bundle verification failed; refusing "
+                "decisions until the pinned bundle verifies again"
+            )
         payload = json.dumps({"input": input_doc}).encode()
         try:
             if self.unix_socket:

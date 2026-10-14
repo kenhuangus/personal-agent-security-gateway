@@ -1,0 +1,12 @@
+{
+  "gateway": {
+    "bundle": {
+      "info": {
+        "name": "personal-agent-security-gateway policy bundle",
+        "policies_dir": "v1",
+        "fingerprint": "942f660e704f304ed5fcbd1123fb8e4aaf8ab82e0f23f69f7c10c461bfbc06d7",
+        "pinned_by": "scripts/pin_bundle_fingerprint.py (re-run after any bundle change)"
+      }
+    }
+  }
+}

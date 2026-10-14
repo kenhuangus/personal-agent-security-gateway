@@ -170,6 +170,19 @@ class InspectOutputStage:
         if self.audit is None:
             return
         action = self.config.injection_action_for(ctx.tool)
+        redacted_args: dict[str, Any] = {
+            "patterns": scan.pattern_ids,
+            "fields": sorted({f.field for f in scan.findings}),
+            "acted": acted,
+        }
+        # GH #15: the byte budget blinds the scanner past the cap —
+        # record that (and how much) so the blind spot is auditable.
+        if getattr(scan, "truncated", False):
+            redacted_args["scan_truncated"] = True
+            redacted_args["scan_truncated_fields"] = list(
+                getattr(scan, "truncated_fields", []))
+            redacted_args["scan_truncated_field_count"] = getattr(
+                scan, "truncated_field_count", 0)
         self.audit.append(
             agent_id=ctx.agent_id,
             tool="inspection.injection_scan",
@@ -177,11 +190,7 @@ class InspectOutputStage:
             request_id=ctx.request_id,
             reason="injected_output_blocked" if action == "block"
                    else "injected_output_redacted",
-            redacted_args={
-                "patterns": scan.pattern_ids,
-                "fields": sorted({f.field for f in scan.findings}),
-                "acted": acted,
-            },
+            redacted_args=redacted_args,
         )
 
     def _log_redaction_event(self, ctx: Any, events: list, scope: str) -> None:

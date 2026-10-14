@@ -814,6 +814,14 @@ class TestInertRendering:
 
 class TestNotifier:
     def _notifier_settings(self, tmp_path, **kw):
+        # GH #16: an unset GATEWAY_NOTIFIER_SECRET_ISSUED_AT now fails
+        # closed (secret_expired), so the default test settings carry a
+        # fresh timestamp; rotation-enforcement tests pass their own
+        # (stale/unset) value.
+        kw.setdefault(
+            "notifier_secret_issued_at",
+            dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
         return Settings(
             config_db_path=str(tmp_path / "config.db"),
             audit_db_path=str(tmp_path / "audit.db"),
@@ -824,6 +832,11 @@ class TestNotifier:
         )
 
     def _settings_for(self, settings, **kw):
+        # GH #16: same fail-closed default as _notifier_settings.
+        kw.setdefault(
+            "notifier_secret_issued_at",
+            dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
         return Settings(
             config_db_path=settings.config_db_path,
             audit_db_path=settings.audit_db_path,

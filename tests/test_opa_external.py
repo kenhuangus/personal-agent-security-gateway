@@ -14,9 +14,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from gateway.opa_client import OpaClient, OpaUnavailable
+from gateway.opa_client import OpaClient, OpaUnavailable, bundle_fingerprint
 
 GOOD_DECISION = {"result": {"effect": "allow", "rule": "r1"}}
+
+#: The pinned bundle's fingerprint, served by the fake OPA's bundle-info
+#: endpoint (GH #17: external mode verifies it at startup).
+GOOD_BUNDLE_INFO = {"result": {"fingerprint": bundle_fingerprint()}}
 
 
 def _serve(handler_cls):
@@ -28,8 +32,11 @@ def _serve(handler_cls):
 
 class _GoodHandler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
-        assert self.path == "/health"
-        body = b"{}"
+        if self.path == "/v1/data/gateway/bundle/info":
+            body = json.dumps(GOOD_BUNDLE_INFO).encode()
+        else:
+            assert self.path == "/health"
+            body = b"{}"
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

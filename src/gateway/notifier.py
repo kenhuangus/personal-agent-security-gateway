@@ -23,6 +23,7 @@ policy-gated ``email.send`` connector (M3 does not wait for M4):
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import smtplib
 import threading
 from dataclasses import dataclass, field
@@ -32,8 +33,9 @@ from typing import Any, Callable, Optional, Protocol
 from .audit import AuditLog
 from .config import Settings
 from .models import as_utc
-from .vault.kms import VaultError
 from .vault.notifier_secret import NotifierSecretProvider
+
+log = logging.getLogger(__name__)
 
 # Max bootstrap-secret age in days (03 §5: rotation via the platform
 # secret store on a documented schedule).
@@ -177,14 +179,42 @@ class Notifier:
         return subject, body
 
     def _secret_age_ok(self) -> tuple[bool, str]:
-        """Enforce the 90-day max bootstrap-secret age (03 §5)."""
+        """Enforce the 90-day max bootstrap-secret age (03 §5).
+
+        GH #16: fail closed. An unset or unparseable
+        GATEWAY_NOTIFIER_SECRET_ISSUED_AT used to PASS vacuously
+        ("secret age unknown") — a deploy that never set the timestamp
+        got no rotation enforcement at all, with only a detail string
+        noting it. Now an unknown age refuses to send, unless the
+        explicit documented escape hatch
+        GATEWAY_NOTIFIER_ALLOW_UNKNOWN_SECRET_AGE=1 is set.
+        """
         raw = self._settings.notifier_secret_issued_at.strip()
+        unknown_ok = self._settings.notifier_allow_unknown_secret_age
         if not raw:
-            return True, "secret age unknown (GATEWAY_NOTIFIER_SECRET_ISSUED_AT unset)"
+            if unknown_ok:
+                return True, (
+                    "secret age unknown (GATEWAY_NOTIFIER_SECRET_ISSUED_AT "
+                    "unset; escape hatch GATEWAY_NOTIFIER_ALLOW_UNKNOWN_SECRET_AGE=1 set)"
+                )
+            return False, (
+                "GATEWAY_NOTIFIER_SECRET_ISSUED_AT is unset: refusing to "
+                "send (90-day rotation cannot be enforced). Set the "
+                "timestamp or GATEWAY_NOTIFIER_ALLOW_UNKNOWN_SECRET_AGE=1."
+            )
         try:
             issued = dt.datetime.fromisoformat(raw)
         except ValueError:
-            return False, f"unparseable GATEWAY_NOTIFIER_SECRET_ISSUED_AT: {raw!r}"
+            if unknown_ok:
+                return True, (
+                    f"unparseable GATEWAY_NOTIFIER_SECRET_ISSUED_AT {raw!r} "
+                    "(escape hatch set)"
+                )
+            return False, (
+                f"unparseable GATEWAY_NOTIFIER_SECRET_ISSUED_AT {raw!r}: "
+                "refusing to send. Fix the timestamp or set "
+                "GATEWAY_NOTIFIER_ALLOW_UNKNOWN_SECRET_AGE=1."
+            )
         if issued.tzinfo is None:
             issued = issued.replace(tzinfo=dt.timezone.utc)
         age_days = (self._clock() - issued).days
@@ -193,6 +223,13 @@ class Notifier:
         return True, f"secret age {age_days}d"
 
     def _cooldown_ok(self, agent_id: str) -> tuple[bool, str]:
+        """Check the per-agent notification cooldown (GH #13: no stamp).
+
+        Stamping used to happen here, BEFORE delivery was attempted —
+        a failed send burned the 5-minute cooldown and a subsequent
+        genuine approval request notified nobody. The stamp now happens
+        in ``_stamp_cooldown``, called only after successful delivery.
+        """
         window = dt.timedelta(minutes=self._settings.notifier_cooldown_minutes)
         now = self._clock()
         with self._lock:
@@ -200,8 +237,12 @@ class Notifier:
             if last is not None and now - last < window:
                 remaining = window - (now - last)
                 return False, f"per-agent cooldown: {remaining} remaining"
-            self._last_sent[agent_id] = now
             return True, ""
+
+    def _stamp_cooldown(self, agent_id: str) -> None:
+        """Record a successful delivery for the per-agent cooldown."""
+        with self._lock:
+            self._last_sent[agent_id] = self._clock()
 
     # -- delivery ------------------------------------------------------
 
@@ -220,6 +261,35 @@ class Notifier:
         outcome "fallback" and is audit-logged. The approval request
         itself is always visible in the console queue.
         """
+        try:
+            return self._notify_inner(
+                agent_id=agent_id, agent_name=agent_name,
+                tool_name=tool_name, approval_id=approval_id,
+                created_at=created_at,
+            )
+        except Exception as exc:  # noqa: BLE001 — GH #13: "never raises"
+            # Last-resort guard: even the audit appends below can fail
+            # (audit-DB outage). Log server-side and degrade to the
+            # in-console queue rather than propagating out of
+            # ApprovalStage.run with no error envelope and no audit row.
+            log.exception(
+                "notify_new_request failed unexpectedly (approval_id=%s)",
+                approval_id,
+            )
+            return NotifyResult(
+                delivered=False, outcome="fallback",
+                detail=f"notifier internal error: {type(exc).__name__}",
+            )
+
+    def _notify_inner(
+        self,
+        *,
+        agent_id: str,
+        agent_name: str,
+        tool_name: str,
+        approval_id: str,
+        created_at: dt.datetime,
+    ) -> NotifyResult:
         ok, detail = self._cooldown_ok(agent_id)
         if not ok:
             return NotifyResult(delivered=False, outcome="cooldown", detail=detail)
@@ -261,7 +331,19 @@ class Notifier:
             if isinstance(transport, SmtpNotifierTransport) and not transport.password:
                 transport.password = secret
             transport.send(to=self._settings.notifier_recipient, subject=subject, body=body)
-        except (NotifierError, VaultError) as exc:
+        except Exception as exc:  # noqa: BLE001 — GH #13: never raises
+            # GH #13: the old handler only caught (NotifierError,
+            # VaultError), but self._secrets.read() or a deploy-chosen
+            # custom transport's send() can raise anything (OSError,
+            # KeyError, TimeoutError) — and the call site in
+            # approvals._create_request ignores the return value with no
+            # guard, so the exception used to propagate out of
+            # Pipeline.run with no envelope and no audit row. The secret
+            # VALUE never appears here (only type/message).
+            log.warning(
+                "notifier send failed (approval_id=%s): %s: %s",
+                approval_id, type(exc).__name__, exc,
+            )
             # A missing bootstrap secret is a configuration failure, not a
             # send failure: degrade to the in-console queue (the approval
             # request itself was already created).
@@ -272,8 +354,13 @@ class Notifier:
                 redacted_args={"approval_request_id": approval_id, "outcome": "fallback",
                                "detail": f"{type(exc).__name__}: {exc}"[:200]},
             )
-            return NotifyResult(delivered=False, outcome="fallback", detail=str(exc)[:200])
+            return NotifyResult(delivered=False, outcome="fallback", detail=f"{type(exc).__name__}: {exc}"[:200])
+        # NOTE (GH #13): no cooldown stamp on the failure path above — a
+        # failed send must not burn the per-agent cooldown; the next
+        # genuine approval request still notifies.
 
+        # GH #13: the cooldown is stamped only after SUCCESSFUL delivery.
+        self._stamp_cooldown(agent_id)
         self._audit.append(
             agent_id="system",
             tool="notifier.send",
