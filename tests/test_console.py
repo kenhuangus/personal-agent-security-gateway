@@ -188,9 +188,18 @@ class TestAdminAuth:
 
     def test_setup_page_shows_qr(self, dbs, settings):
         client = _make_client(dbs, settings)
-        r = client.get("/setup")
+        # GH #20: the test client is non-loopback, so /setup needs the
+        # one-time startup token.
+        token = client.app.state.setup_token
+        r = client.get(f"/setup?token={token}")
         assert r.status_code == 200
         assert "data:image/png;base64," in r.text  # QR provisioning
+
+    def test_setup_denied_without_token(self, dbs, settings):
+        # GH #20: non-loopback /setup without the token is 403.
+        client = _make_client(dbs, settings)
+        r = client.get("/setup", follow_redirects=False)
+        assert r.status_code == 403
 
     def test_failed_login_is_audit_logged(self, dbs, settings):
         client = _make_client(dbs, settings)

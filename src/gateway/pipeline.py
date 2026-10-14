@@ -337,6 +337,15 @@ class AuthenticateStage:
                 return make_error("agent_paused", "agent is paused", ctx.request_id)
             if code == "agent_canceled":
                 return make_error("agent_canceled", "agent work was canceled", ctx.request_id)
+            if code == "fallback_bearer_expired":
+                # GH #21: distinct code directing the admin to rotate the
+                # fallback Bearer <redacted> (console agents page).
+                return make_error(
+                    "fallback_bearer_expired",
+                    "fallback Bearer <redacted> exceeded max age — "
+                    "rotate it in the admin console",
+                    ctx.request_id,
+                )
             return make_error("auth_failed", "agent authentication failed", ctx.request_id)
         ctx.agent = result.agent
         ctx.credential_kind = result.credential_kind
@@ -796,6 +805,9 @@ def _judge_wiring(
             escalation=escalation_from_settings(settings),
             threshold=0.75,
             timeout_s=getattr(settings, "judge_timeout_s", 2.0),
+            # GH #31: readiness alert after N minutes of continuous
+            # unreachability.
+            alert_after_minutes=getattr(settings, "judge_alert_after_minutes", 5.0),
         )
     hook = JudgeInspectionHook(
         cascade, always_on=getattr(settings, "judge_always_on", False)
@@ -829,7 +841,9 @@ def build_m1_pipeline(
     """
     settings = settings or Settings()
     registry = registry if registry is not None else ConnectorRegistry()
-    identity = IdentityService(config_db)
+    identity = IdentityService(
+        config_db, settings.fallback_bearer_max_days
+    )
     mandates = MandateService(config_db)
     audit = AuditLog(audit_db)
     # M5 inspection wiring (shared by both builders).
@@ -908,7 +922,9 @@ def build_pipeline(
 
     settings = settings or Settings()
     registry = registry if registry is not None else ConnectorRegistry()
-    identity = IdentityService(config_db)
+    identity = IdentityService(
+        config_db, settings.fallback_bearer_max_days
+    )
     mandates = MandateService(config_db)
     audit = AuditLog(audit_db)
     # M5 inspection wiring (shared by both builders).
@@ -1010,7 +1026,7 @@ def execute_approved_call(
     Returns ``{"ok", "result" | "error", "request_id"}``.
     """
     # Lazy: keeps the top-level import arrow one-way (see build_pipeline).
-    from .approvals import UnknownOutcomeService
+    from .approvals import UnknownOutcomeService, policy_materially_superseded
     from .counterparty import CounterpartyService
 
     settings = settings or Settings()
@@ -1029,25 +1045,42 @@ def execute_approved_call(
         if hmac_ring is not None:
             ctx.argument_hash = argument_hash(ctx.args, hmac_ring)
 
-        stages: list[Stage] = [
-            ValidateInputsStage(registry),
-            MandateStage(mandates),
-            TokenMintStage(minter if minter is not None else StubTokenMinter()),
-            ExecuteStage(registry, unknown_outcome=unknown_outcome),
-            InspectOutputStage(audit=audit, catalog=catalog, config=InspectionConfig()),
-        ]
         error: Optional[GatewayError] = None
-        for stage in stages:
-            with timing_span(ctx, f"stage:{stage.name}"):
-                error = stage.run(ctx)
-            if error is not None:
-                ctx.decision = _decision_for_error(error)
-                ctx.deny_reason = error.details.get("reason")
-                if ctx.deny_reason is None and error.code in SAFE_REASONS:
-                    ctx.deny_reason = error.code
-                break
-        else:
-            ctx.decision = "allowed_via_approval"
+        # GH #23: policy-supersession re-check at replay start. A material
+        # policy change landing between approval (grant consumed, with the
+        # supersession check) and this server-side replay must not execute
+        # under the old policy. Uses the same material-change semantics as
+        # the grant path (approvals.policy_materially_superseded): a
+        # non-material version does not block the replay.
+        if policy_materially_superseded(config_db, policy_version):
+            error = policy_denied(
+                ctx.request_id,
+                "policy_superseded",
+                f"{tool}: policy changed materially since this call was "
+                "approved; re-request approval",
+                tool=tool,
+            )
+            ctx.decision = _decision_for_error(error)
+            ctx.deny_reason = "policy_superseded"
+        if error is None:
+            stages: list[Stage] = [
+                ValidateInputsStage(registry),
+                MandateStage(mandates),
+                TokenMintStage(minter if minter is not None else StubTokenMinter()),
+                ExecuteStage(registry, unknown_outcome=unknown_outcome),
+                InspectOutputStage(audit=audit, catalog=catalog, config=InspectionConfig()),
+            ]
+            for stage in stages:
+                with timing_span(ctx, f"stage:{stage.name}"):
+                    error = stage.run(ctx)
+                if error is not None:
+                    ctx.decision = _decision_for_error(error)
+                    ctx.deny_reason = error.details.get("reason")
+                    if ctx.deny_reason is None and error.code in SAFE_REASONS:
+                        ctx.deny_reason = error.code
+                    break
+            else:
+                ctx.decision = "allowed_via_approval"
         # The audit row links to the approval that authorized this
         # replay (the grant's mandate), not whatever mandate happens
         # to be live now.

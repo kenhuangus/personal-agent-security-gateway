@@ -18,6 +18,7 @@
 <form method="post" action="/setup">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input type="hidden" name="totp_seed" value="{{ totp_secret }}">
+  <input type="hidden" name="setup_token" value="{{ setup_token or '' }}">
   <label>Admin password (min 12 characters)<br><input type="password" name="password" autocomplete="new-password" required minlength="12"></label>
   <label>Authenticator code<br><input type="text" name="totp_code" inputmode="numeric" autocomplete="one-time-code" required></label>
   <button type="submit">Create admin</button>

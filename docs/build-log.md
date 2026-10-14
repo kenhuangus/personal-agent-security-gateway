@@ -1993,3 +1993,101 @@ AC-11 budget; the instrumentation itself does not touch the budget.
   runtime, `repr=False` in Settings); no code copied from other repos
   (adapter written from the OpenAI chat-completions contract).
 
+
+## 2026-10-13 — Batch 2 PR-B: config/semantics/traceability mediums (GH #19–#27, #30, #31)
+
+Branch `fix/mediums-b` → PR-B against `main`. 11 issues (one filed low), all fail-closed.
+
+- **#19 TLS awareness** (`config.py`, `mcp_server.py`): new `GATEWAY_TLS_TERMINATED`
+  setting; `check_tls_posture()` refuses to start on a non-loopback bind
+  without it (Fix A requires per-agent secrets over TLS). Escape hatch
+  `GATEWAY_ALLOW_PLAINTEXT_NONLOOPBACK=1` downgrades to a loud warning (LAN
+  testing only). Documented in README (new "TLS requirement" section) and the
+  compose file. BEHAVIOR CHANGE for 0.0.0.0 binds — flagged.
+- **#20 first-run /setup gating** (`console/app.py`, `templates/setup.html`):
+  when no admin exists, startup mints a single-use token
+  (`app.state.setup_token`, dies with the process, cleared on setup) and logs
+  it CRITICAL. Non-loopback `/setup` (GET `?token=`, POST form field) requires
+  it; loopback keeps working token-free; `dev_no_auth` (test-only) bypasses.
+  The "no admin" state is now impossible to miss in the logs.
+- **#21 fallback-Bearer <redacted> max age** (`identity.py`, `errors.py`,
+  `pipeline.py`, `mcp_server.py`): `authenticate()` now DENIES fallback_bearer
+  credentials older than `fallback_bearer_max_days` (default 90; age from
+  `last_rotated_at`, falling back to `issued_at`; fail closed on missing
+  timestamps) with the distinct `fallback_bearer_expired` code (new
+  `retryable: "rotate_credential"`), mapped in both the pipeline
+  `AuthenticateStage` and the MCP transport middleware. OAuth credentials
+  unaffected.
+- **#22 derived-token validation semantics** (`vault/minter.py`,
+  `vault/mock_oauth_issuer.py`): contract now explicit — the LEDGER is the
+  authority (ledger hit + `now` < ledger's `expires_at_epoch` + binding match).
+  The token object's self-asserted expiry is ignored (forgeable); the issuer
+  is consulted ONLY when `UpstreamTokenIssuer.supports_introspection` (the
+  mock sets True — it models an introspectable provider; production
+  Google/Microsoft opaque-token issuers leave it False). `test_ttl_enforcement`
+  rewritten to expire via the ledger.
+- **#23 replay supersession re-check** (`pipeline.py`, `approvals.py`):
+  `execute_approved_call` checks `policy_materially_superseded()` at replay
+  start (new shared helper; `GrantService._superseded` refactored onto it) and
+  denies with `policy_superseded` when a MATERIAL policy version landed after
+  the approval. Non-material versions don't block — same semantics as the
+  grant path (FR-PAA04-003). Interpretive call, flagged.
+- **#24 escalation traceability** (`policy.py`): `_maybe_escalate` now carries
+  `matched_rule_id`, `scope_rule`, `ontology_snapshot_ref`, `ontology_ref`,
+  `data_snapshot_id` into the escalated result; the allow branch also attaches
+  `ontology_ref` so there is something to carry.
+- **#25 ontology-clause deny snapshots** (`policies/v1/authz.rego`,
+  `policy.py`): `trace_info` now emits `ontology_shaped` for deny effects too;
+  the Python PAA04 capture comment fixed to describe the actual condition; when
+  the Rego cites no entry (plain ontology-clause rules), Python synthesizes
+  the citation from the deciding rule (`entry_kind: "rule"`).
+- **#26 rule shape validation** (`policy.py`, `authz.rego` `rule_problems`):
+  `validate_rule_dict` + new Rego `problem_time_window` /
+  `problem_tool_selector` reject `start: "9"`, `days: ["funday"]`, and bare
+  `"*"` (or misplaced-wildcard) selectors at save time. Days normalized to
+  lowercase; empty `days` keeps its documented never-match semantics.
+- **#27 HmacKeyRing.matches total** (`hmac_util.py`, filed LOW): unknown key id
+  → `False` instead of `ValueError`; `verify_snapshot` no longer crashes on
+  forged/retired-key refs.
+- **#30 OPA binary** (`third_party/opa/OPA_VERSION`, `opa_client.py`,
+  `scripts/verify_opa.sh`, `docker-compose.yml`): single source of truth
+  (`1.8.0`); the client reads it (fallback to last-known); `verify_opa.sh`
+  downloads from the official release when missing, always SHA-256-pinned
+  (pin verified byte-identical against the official v1.8.0 release);
+  compose uses `openpolicyagent/opa:${OPA_VERSION:-1.8.0}`.
+- **#31 kev-serve supervision** (`docker-compose.yml`,
+  `deploy/kev-serve.service`, `judge/health.py`, `judge/cascade.py`,
+  `config.py`, `pipeline.py`): compose kev gets `restart: unless-stopped`;
+  new systemd unit template for bare-metal hosts (NOT installed here — this VM
+  keeps cron+ensure-up.sh); new process-wide judge health registry —
+  `JudgeCascade` records success/`JudgeUnavailable` per backend (skipping the
+  deliberately-off `"none"` backend); CRITICAL readiness alert after
+  `GATEWAY_JUDGE_ALERT_AFTER_MINUTES` (default 5) of continuous
+  unreachability, once per outage, with recovery INFO.
+
+Tests: 49 new in `tests/test_mediums_b.py` (all pass); updated
+`test_ttl_enforcement` (ledger-expiry) and the console `/setup` tests (token).
+New rego test: deny with ontology clause → shaped (71/71 `opa test` pass;
+`opa fmt --fail` clean).
+Full suite on the branch: 664 passed, 8 skipped, 1 pre-existing timing flake
+(`TestPollBudget::test_own_budget_and_no_audit_rows` — calendar-minute
+boundary in the rate limiter; passes in isolation and on the PR-A run;
+unrelated to these changes).
+
+Flags for Ken:
+- #19: refuse-to-start is a behavior change for non-loopback binds without
+  `GATEWAY_TLS_TERMINATED=1` (escape hatch documented).
+- #23: material-only supersession (consistent with the grant path), not the
+  literal "deny on any version mismatch" — say the word if you want stricter.
+- #27 was filed as LOW severity; fixed anyway.
+- #30: the 69MB binary is in git HISTORY (0d41b97) though untracked at HEAD —
+  true removal needs a history rewrite; recommend against, your call. CI must
+  export `OPA_VERSION=$(cat third_party/opa/OPA_VERSION)` before compose
+  (or rely on the `:-1.8.0` default, kept in sync).
+- #22: production Google/Microsoft issuers must leave
+  `supports_introspection=False` — the ledger becomes the sole authority
+  (documented contract).
+- #31: the systemd unit is a template for real hosts; this VM keeps
+  cron+ensure-up.sh. The live kev-0.8b on 127.0.0.1:8009 was left untouched.
+- GH #10 ("rate-limiter increment atomic") is a medium NOT in the fix-all
+  task list — needs assignment; deliberately untouched.

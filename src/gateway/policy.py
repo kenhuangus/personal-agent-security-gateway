@@ -465,6 +465,69 @@ def normalize_effect(effect: str) -> str:
 # Rule validation (on save)
 # ---------------------------------------------------------------------
 
+# ---------------------------------------------------------------------
+# Rule shape validation (GH #26)
+# ---------------------------------------------------------------------
+
+#: HH:MM, 24-hour clock — the shape time_window start/end must have.
+#: Anything else (e.g. "9") silently never matches at evaluation time.
+_HHMM_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+
+#: Weekday vocabulary for time_window days (the Rego lowercases at
+#: evaluation, so validation is case-insensitive).
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _validate_time_window_shape(spec: dict[str, Any]) -> None:
+    """Reject malformed ``conditions.time_window`` at save time.
+
+    A malformed window (``"start": "9"``, ``"days": ["funday"]``) is
+    fail-closed but undebuggable: the rule looks fine in the console and
+    can never fire. Raises ValueError.
+    """
+    for key in ("start", "end"):
+        val = spec.get(key)
+        if val is not None and (not isinstance(val, str) or not _HHMM_RE.match(val)):
+            raise ValueError(
+                f"conditions.time_window.{key} must be HH:MM (24-hour), "
+                f"got {val!r}"
+            )
+    days = spec.get("days")
+    if days is not None:
+        if not isinstance(days, list):
+            raise ValueError("conditions.time_window.days must be a list")
+        for day in days:
+            if not isinstance(day, str) or day.lower() not in _WEEKDAYS:
+                raise ValueError(
+                    f"conditions.time_window.days: unknown weekday {day!r}; "
+                    f"want one of {list(_WEEKDAYS)}"
+                )
+        # Normalize to the vocabulary the Rego matches against.
+        spec["days"] = [d.lower() for d in days]
+
+
+def _validate_tool_selector_shape(selector: Any) -> None:
+    """Reject tool selectors that can never match at save time.
+
+    The matcher understands exact names and ``"prefix.*"`` wildcards
+    only — a bare ``"*"`` (or any other misplaced wildcard) silently
+    matches nothing. Raises ValueError.
+    """
+    if not isinstance(selector, str) or not selector:
+        raise ValueError(
+            f"rule tool selector must be a non-empty string, got {selector!r}"
+        )
+    if "*" not in selector:
+        return  # exact tool name
+    prefix, _, suffix = selector.rpartition("*")
+    if suffix == "" and prefix.endswith(".") and "*" not in prefix[:-1] and len(prefix) > 1:
+        return  # well-formed "prefix.*" wildcard
+    raise ValueError(
+        f"rule tool selector {selector!r} never matches: use an exact "
+        "tool name or 'prefix.*'"
+    )
+
+
 def validate_rule_dict(rule: dict[str, Any]) -> dict[str, Any]:
     """Validate a rule dict from the builder/raw mode (02 §5).
 
@@ -503,6 +566,9 @@ def validate_rule_dict(rule: dict[str, Any]) -> dict[str, Any]:
             ZoneInfo(tz)
         except ZoneInfoNotFoundError:
             raise ValueError(f"conditions.time_window.tz: unknown timezone {tz!r}")
+        # GH #26: validate the window shape — a malformed window
+        # silently never matches (fail-closed but undebuggable).
+        _validate_time_window_shape(time_window)
         schedule = (conditions.get("notice") or {}).get("schedule")
         if isinstance(schedule, dict):
             stz = schedule.get("tz") or "UTC"
@@ -522,6 +588,10 @@ def validate_rule_dict(rule: dict[str, Any]) -> dict[str, Any]:
     agents = conditions.get("agents")
     if agents is not None and not isinstance(agents, list):
         raise ValueError("conditions.agents must be a list")
+    # GH #26: a bare "*" (or misplaced wildcard) silently never matches —
+    # reject it at save time so the admin gets feedback.
+    if r.get("tool") is not None:
+        _validate_tool_selector_shape(r["tool"])
     if rule_type == "notice":
         # A notice rule is a standing POLICY RULE (FR-PAA07-005), not a
         # grant: it authorizes matching executions, nothing else.
@@ -1407,10 +1477,11 @@ class PolicyEngine:
             )
 
         # PAA04: capture the ontology decision snapshot when the
-        # ontology shaped the decision (mirrors the pre-pivot capture
-        # condition exactly: deciding rule had an ontology clause or a
-        # preference group was applicable — the Rego sets
-        # ontology_shaped only on those paths).
+        # ontology shaped the decision — the Rego sets ontology_shaped
+        # on allow AND deny effects (GH #25) whenever the deciding rule
+        # had an ontology clause or a preference group was applicable.
+        # The snapshot (and the ontology_ref entry citation) is therefore
+        # present for ontology-driven denies too, not just allows.
         snapshot_ref: Optional[str] = None
         if decision.get("ontology_shaped") and self.hmac_ring is not None:
             snapshot_ref = capture_snapshot(
@@ -1443,6 +1514,17 @@ class PolicyEngine:
                 "entry_kind": raw_ref.get("entry_kind"),
                 "snapshot_ref": snapshot_ref,
             }
+        elif decision.get("ontology_shaped") and matched_rule_id is not None:
+            # GH #25: the Rego cites an ontology entry only on the
+            # preference-group / owner-approval paths. For a plain
+            # ontology-clause rule (allow or deny), synthesize the
+            # citation from the deciding rule — otherwise the entry
+            # citation is missing for ontology-driven decisions.
+            ontology_ref = {
+                "entry_id": f"rule:{matched_rule_id}",
+                "entry_kind": "rule",
+                "snapshot_ref": snapshot_ref,
+            }
 
         if effect == "allow":
             name = id_to_name.get(matched_rule_id, "")
@@ -1455,6 +1537,10 @@ class PolicyEngine:
                         if matched_rule_id is not None else None
                     ),
                     ontology_snapshot_ref=snapshot_ref,
+                    # GH #24: the entry citation travels on allows too, so
+                    # a counterparty escalation (allow → require_approval)
+                    # can carry it into the approval record.
+                    ontology_ref=ontology_ref,
                     data_snapshot_id=snapshot_id,
                 ),
                 agent, tool, intent.params,
@@ -1505,9 +1591,18 @@ class PolicyEngine:
             reason = "escalator_error"
         if reason is None:
             return result
+        # GH #24: carry the traceability fields into the escalated result.
+        # The approval record and audit row for an escalated call must not
+        # lose which rule allowed it (FR-PAA01-007 scope_rule), the PAA04
+        # ontology snapshot ref / entry citation, or the input-document
+        # version — escalated calls are exactly the highest-risk ones.
         return EvaluationResult(
-            "require_approval", None, True,
+            "require_approval", result.matched_rule_id, True,
             policy_version=result.policy_version,
+            scope_rule=result.scope_rule,
+            ontology_snapshot_ref=result.ontology_snapshot_ref,
+            ontology_ref=result.ontology_ref,
+            data_snapshot_id=result.data_snapshot_id,
             escalation_reason=reason,
         )
 

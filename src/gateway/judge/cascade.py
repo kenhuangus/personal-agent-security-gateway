@@ -77,11 +77,15 @@ class JudgeCascade:
         escalation: Optional[DecisionBackend] = None,
         threshold: float = 0.75,
         timeout_s: float = 2.0,
+        alert_after_minutes: float = 5.0,
     ) -> None:
         self.primary = primary
         self.escalation = escalation
         self.threshold = threshold
         self.timeout_s = timeout_s
+        # GH #31: readiness alert after this many minutes of continuous
+        # backend unreachability (see judge/health.py).
+        self.alert_after_s = alert_after_minutes * 60.0
 
     def decide(
         self, state: str, questions: list[Question]
@@ -102,22 +106,33 @@ class JudgeCascade:
         self, state: str, questions: list[Question]
     ) -> CascadeResult:
         """The cascade body. Raises JudgeUnavailable when no backend answers."""
+        from .health import record_failure, record_success
+
         path = [self.primary.name]
         start = time.perf_counter()
         try:
             primary_result = self.primary.decide(state, questions, self.timeout_s)
         except JudgeUnavailable:
+            # GH #31: reachability supervision (skips DisabledBackend —
+            # "none" is deliberately off, not an outage).
+            record_failure(self.primary.name, self.alert_after_s)
             # Fail-closed: one escalation attempt, then propagate.
             if self.escalation is None:
                 raise
             path.append(self.escalation.name)
-            esc = self.escalation.decide(state, questions, self.timeout_s)
+            try:
+                esc = self.escalation.decide(state, questions, self.timeout_s)
+            except JudgeUnavailable:
+                record_failure(self.escalation.name, self.alert_after_s)
+                raise
+            record_success(self.escalation.name)
             return CascadeResult(
                 answers=esc.answers,
                 escalated=True,
                 latency_ms=(time.perf_counter() - start) * 1000.0,
                 backend_path=path,
             )
+        record_success(self.primary.name)
         primary_ms = (time.perf_counter() - start) * 1000.0
         min_confidence = min(
             (a.confidence for a in primary_result.answers.values()),
@@ -139,7 +154,12 @@ class JudgeCascade:
                 low_confidence=True,
             )
         path.append(self.escalation.name)
-        esc = self.escalation.decide(state, questions, self.timeout_s)
+        try:
+            esc = self.escalation.decide(state, questions, self.timeout_s)
+        except JudgeUnavailable:
+            record_failure(self.escalation.name, self.alert_after_s)
+            raise
+        record_success(self.escalation.name)
         return CascadeResult(
             answers=esc.answers,
             escalated=True,

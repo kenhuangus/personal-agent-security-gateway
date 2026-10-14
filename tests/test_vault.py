@@ -470,9 +470,18 @@ class TestVaultTokenMinter:
         assert "<derived>" not in dumped  # the value is never in the row at all
 
     def test_ttl_enforcement(self, minter, issuer):
+        # GH #22: the LEDGER is the authority on expiry — not the
+        # token's self-asserted expires_at_epoch and (for opaque upstream
+        # tokens) not issuer introspection.
+        import time
+
+        from gateway.vault.minter import _ledger_key
+
         tok = minter.mint(self._ctx())
         assert minter.validate_token(tok)
-        issuer.expire(tok.raw())
+        minter._ledger[_ledger_key(tok.raw())].expires_at_epoch = (
+            time.time() - 1
+        )
         assert not minter.validate_token(tok)
 
     def test_scope_bookkeeping_agent_and_tool(self, minter):

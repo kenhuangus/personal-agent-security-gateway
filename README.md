@@ -143,6 +143,13 @@ Notes:
 | `GATEWAY_REFUSAL_COOLDOWN_H` | `24` | post-denial refusal cooldown (M3) |
 | `GATEWAY_AUDIT_RETENTION_DAYS` | `90` | audit retention |
 | `GATEWAY_HOST` / `GATEWAY_PORT` | `127.0.0.1` / `8000` | server bind |
+| `GATEWAY_TLS_TERMINATED` | `0` | **TLS (GH #19):** set `1` when a TLS-terminating reverse proxy / platform ingress sits in front of the gateway. Binding a non-loopback address without this REFUSES to start (Fix A requires per-agent secrets over TLS) |
+| `GATEWAY_ALLOW_PLAINTEXT_NONLOOPBACK` | `0` | **TLS escape hatch:** `1` downgrades the refuse-to-start to a loud warning. LAN testing only — never production |
+| `GATEWAY_PIPELINE_TIMEOUT_S` | `120.0` | overall bound on one pipeline execution; `≤0` disables (GH #9) |
+| `GATEWAY_NOTIFIER_ALLOW_UNKNOWN_SECRET_AGE` | `0` | escape hatch for the fail-closed notifier rotation check (GH #16) |
+| `GATEWAY_AUDIT_DEAD_LETTER` | `data/audit-dead-letter.jsonl` | spill file for audit rows when the audit DB is down (GH #18); replay with `scripts/replay_audit_dead_letter.py` |
+| `GATEWAY_OPA_BUNDLE_CHECK_SECONDS` | `300` | external-OPA bundle fingerprint re-verification interval (GH #17) |
+| `GATEWAY_JUDGE_ALERT_AFTER_MINUTES` | `5` | **JUDGE:** minutes of continuous backend unreachability before the CRITICAL readiness alert (GH #31) |
 | `GATEWAY_JUDGE_BACKEND` | `none` | **JUDGE (opt-in):** judge primary — `none`\|`kev`\|`jev` |
 | `GATEWAY_JUDGE_ESCALATION` | `none` | **JUDGE (opt-in):** cascade escalation — `none`\|`jev`\|`llm` (see below) |
 | `GATEWAY_LLM_ESCALATION_URL` | `http://127.0.0.1:11434` | **JUDGE:** OpenAI-compatible chat-completions base (Ollama default; vLLM/SGLang by URL) |
@@ -161,6 +168,25 @@ Per-agent secret over TLS; no third rung (Fix A):
 The credential is validated on **every** request (the session ID alone never
 suffices). The gateway-as-OAuth-authorization-server code exchange arrives in a
 later milestone; `mock_oauth.py` covers the token shape for tests.
+
+### TLS requirement (GH #19)
+
+The gateway itself speaks plain HTTP. "Per-agent secret over TLS" (above)
+means **you must terminate TLS in front of the gateway** in production — a
+reverse proxy (Caddy, nginx, Traefik) or platform ingress with a certificate —
+and set `GATEWAY_TLS_TERMINATED=1` so the startup check knows the traffic is
+protected.
+
+- Binding a **loopback** address (`127.0.0.1`, the default) needs nothing.
+- Binding a **non-loopback** address (`0.0.0.0`, a LAN IP) without
+  `GATEWAY_TLS_TERMINATED=1` makes the gateway **refuse to start** rather
+  than send OAuth client secrets and Bearer <redacted> in cleartext.
+- `GATEWAY_ALLOW_PLAINTEXT_NONLOOPBACK=1` downgrades the refusal to a loud
+  warning — LAN testing only, never production.
+- The admin console (`/setup`, session cookie) is served by the same
+  process: the same TLS requirement applies, and first-run `/setup` from a
+  non-loopback address additionally requires the one-time setup token
+  printed in the startup log (GH #20).
 
 ## Judge escalation backend (`llm`) — bring-your-own escalation model
 

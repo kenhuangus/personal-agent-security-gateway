@@ -57,8 +57,13 @@ def _check_secret(secret: str, secret_hash: str) -> bool:
 
 
 class IdentityService:
-    def __init__(self, db: Session) -> None:
+    def __init__(self, db: Session, fallback_bearer_max_days: int = 90) -> None:
         self.db = db
+        # GH #21: the fallback bearer is a mandatory-rotation credential
+        # (00 §7 param 1). The max age is enforced in authenticate(), not
+        # just reported by bearer_age_days(). Default mirrors
+        # Settings.fallback_bearer_max_days.
+        self.fallback_bearer_max_days = fallback_bearer_max_days
 
     # -- registration ---------------------------------------------------
 
@@ -229,6 +234,21 @@ class IdentityService:
             raise ValueError("credential expired")  # -> auth_failed
         if not _check_secret(presented_secret, cred.secret_hash):
             raise ValueError("bad credential")  # -> auth_failed
+        # GH #21: enforce the mandatory rotation. A fallback bearer older
+        # than fallback_bearer_max_days is denied with a distinct code
+        # directing the admin to rotate (console "agents" page), instead of
+        # living forever on an advisory age indicator.
+        if cred.kind == "fallback_bearer":
+            rotated_at = cred.last_rotated_at or cred.issued_at
+            if rotated_at is None:
+                # No issuance timestamp at all: fail closed (deny) rather
+                # than treat the age as unknown-and-fine.
+                raise ValueError("fallback_bearer_expired")
+            age_days = (
+                dt.datetime.now(dt.timezone.utc) - as_utc(rotated_at)
+            ).total_seconds() / 86400.0
+            if age_days > self.fallback_bearer_max_days:
+                raise ValueError("fallback_bearer_expired")
         agent.last_seen_at = dt.datetime.now(dt.timezone.utc)
         self.db.commit()
         return AuthResult(agent=agent, credential_kind=cred.kind)

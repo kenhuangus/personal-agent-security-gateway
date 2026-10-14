@@ -31,6 +31,8 @@ keep exercising the pages unchanged.
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import secrets
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -156,6 +158,27 @@ def create_console_app(
         approval_deps.vault_store = vault_store
 
     admin_auth = AdminAuth(settings, audit_session_factory)
+
+    # GH #20: first-run /setup guard. When no admin exists yet, /setup is
+    # in _OPEN_PATHS (no auth) — anyone who can reach the console could
+    # claim the admin account. From non-loopback addresses /setup now
+    # requires a single-use token printed LOUDLY at startup; loopback
+    # keeps working token-free. The token dies with the process (and is
+    # cleared the moment setup completes).
+    with config_session_factory() as _db:
+        _no_admin = not admin_auth.admin_exists(_db)
+    if _no_admin and not dev_no_auth:
+        app.state.setup_token = secrets.token_urlsafe(32)
+        logging.getLogger(__name__).critical(
+            "NO ADMIN PROVISIONED: the console has no admin account. "
+            "First-run /setup is reachable WITHOUT auth — from loopback "
+            "it works directly; from any other address it requires the "
+            "one-time setup token: %s (pass as ?token=...; single use, "
+            "valid for this process only). Complete /setup immediately.",
+            app.state.setup_token,
+        )
+    else:
+        app.state.setup_token = None
     health = HealthMonitor()
     for connector in approval_deps.connectors:
         health.register(connector)
@@ -212,16 +235,45 @@ def create_console_app(
     # ------------------------------------------------------------------
     # Admin auth routes (FR-036/039/040; 02 §2.6)
     # ------------------------------------------------------------------
+    def _is_loopback(request: Request) -> bool:
+        client = request.client
+        return client is not None and client.host in ("127.0.0.1", "::1")
+
+    def _setup_gate(request: Request, token: str | None) -> HTMLResponse | None:
+        """GH #20: guard the unauthenticated first-run /setup.
+
+        Returns None when the request may proceed, otherwise the
+        response to send (redirect or 403). Loopback is always allowed;
+        non-loopback requires the single-use startup token.
+        ``dev_no_auth`` (TEST ONLY) bypasses the gate.
+        """
+        if dev_no_auth:
+            return None
+        if _is_loopback(request):
+            return None
+        expected = app.state.setup_token
+        if expected and token and secrets.compare_digest(token, expected):
+            return None
+        return HTMLResponse(
+            "first-run setup requires a loopback connection or the "
+            "one-time setup token printed in the console startup log",
+            status_code=403,
+        )
+
     @app.get("/setup", include_in_schema=False)
     def setup_page(request: Request) -> HTMLResponse:
         with config_session_factory() as db:
             if admin_auth.admin_exists(db):
                 return RedirectResponse(url="/login", status_code=302)
+        gate = _setup_gate(request, request.query_params.get("token"))
+        if gate is not None:
+            return gate
         secret = new_totp_secret()
         token = csrf.issue()
         resp = _render(
             "setup.html", csrf_token=token, totp_secret=secret,
             qr_data_uri=totp_qr_data_uri(secret),
+            setup_token=request.query_params.get("token", ""),
         )
         csrf.set_cookie(resp, token)
         return resp
@@ -233,9 +285,13 @@ def create_console_app(
         totp_code: str = Form(...),
         totp_seed: str = Form(...),
         csrf_token: str = Form(""),
+        setup_token: str = Form(""),
     ) -> HTMLResponse:
         if not csrf.check_request(request.cookies, request.headers, csrf_token):
             return csrf_fail()
+        gate = _setup_gate(request, setup_token or None)
+        if gate is not None:
+            return gate
         with config_session_factory() as db:
             if admin_auth.admin_exists(db):
                 return RedirectResponse(url="/login", status_code=302)
@@ -245,6 +301,7 @@ def create_console_app(
                     "setup.html", csrf_token=token, totp_seed=totp_seed,
                     qr_data_uri=totp_qr_data_uri(totp_seed),
                     error="That authenticator code did not verify — check the app and try again.",
+                    setup_token=setup_token,
                 )
                 csrf.set_cookie(resp, token)
                 return resp
@@ -255,9 +312,13 @@ def create_console_app(
                 resp = _render(
                     "setup.html", csrf_token=token, totp_seed=totp_seed,
                     qr_data_uri=totp_qr_data_uri(totp_seed), error=str(exc),
+                    setup_token=setup_token,
                 )
                 csrf.set_cookie(resp, token)
                 return resp
+            # GH #20: single-use — the token dies with the first completed
+            # setup (an admin now exists, so /setup redirects anyway).
+            request.app.state.setup_token = None
         session_token, _exp = admin_auth.issue_session()
         resp = RedirectResponse(url="/dashboard", status_code=302)
         admin_auth.set_session_cookie(resp, session_token)

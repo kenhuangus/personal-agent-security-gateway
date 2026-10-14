@@ -13,6 +13,7 @@ design targets, not promises.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 
@@ -119,6 +120,20 @@ class Settings:
     # --- server ---
     host: str = field(default_factory=lambda: _env("GATEWAY_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: _env_int("GATEWAY_PORT", 8000))
+    # --- TLS posture (GH #19) ---
+    # Fix A requires per-agent secrets "over TLS". The gateway itself
+    # speaks plain HTTP; production deployments MUST terminate TLS in
+    # front of it (reverse proxy / platform ingress) and set this so
+    # the startup check knows the traffic is protected.
+    tls_terminated: bool = field(
+        default_factory=lambda: bool(_env_int("GATEWAY_TLS_TERMINATED", 0))
+    )
+    # Escape hatch for plaintext-on-LAN testing. Refusing to start is
+    # the default; this opts back into a LOUD warning instead. Never
+    # enable in production.
+    allow_plaintext_nonloopback: bool = field(
+        default_factory=lambda: bool(_env_int("GATEWAY_ALLOW_PLAINTEXT_NONLOOPBACK", 0))
+    )
 
     # --- console display ---
     # 00 §7 param 15: UTC in storage, Ken's local timezone in display.
@@ -167,6 +182,11 @@ class Settings:
     judge_timeout_s: float = field(
         default_factory=lambda: float(_env("GATEWAY_JUDGE_TIMEOUT_S", "2.0"))
     )
+    # Judge-backend supervision (GH #31): how many minutes of continuous
+    # unreachability before the CRITICAL readiness alert fires.
+    judge_alert_after_minutes: float = field(
+        default_factory=lambda: float(_env("GATEWAY_JUDGE_ALERT_AFTER_MINUTES", "5"))
+    )
     # --- judge pipeline hooks (advisory; default OFF) ---
     # GATEWAY_JUDGE_ENABLED=1 lets the pipeline INSTALL the judge hooks
     # (inspection second-opinion, intent risk step-up, counterparty
@@ -211,7 +231,58 @@ class Settings:
             )
         if self.judge_timeout_s <= 0:
             problems.append("GATEWAY_JUDGE_TIMEOUT_S must be > 0")
+        if self.judge_alert_after_minutes < 0:
+            problems.append("GATEWAY_JUDGE_ALERT_AFTER_MINUTES must be >= 0")
         return problems
+
+
+# ---------------------------------------------------------------------
+# TLS posture (GH #19)
+# ---------------------------------------------------------------------
+
+#: Hosts that never leave the machine: binding one of these needs no
+#: TLS-terminating proxy.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def is_loopback_host(host: str) -> bool:
+    """True when *host* is a loopback bind (no network exposure)."""
+    return host.strip().lower() in _LOOPBACK_HOSTS
+
+
+def check_tls_posture(host: str, settings: "Settings") -> None:
+    """Fail closed when binding a non-loopback address without TLS.
+
+    Fix A requires per-agent secrets "over TLS". The gateway serves
+    plain HTTP itself, so a non-loopback bind is only safe behind a
+    TLS-terminating proxy (``GATEWAY_TLS_TERMINATED=1``). Without it,
+    refuse to start — unless the explicit escape hatch
+    ``GATEWAY_ALLOW_PLAINTEXT_NONLOOPBACK=1`` is set, which downgrades
+    to a loud warning (LAN testing only, never production).
+
+    Raises:
+        RuntimeError: non-loopback bind with no TLS termination and no
+            escape hatch.
+    """
+    if is_loopback_host(host):
+        return
+    if settings.tls_terminated:
+        return
+    if settings.allow_plaintext_nonloopback:
+        logging.getLogger(__name__).warning(
+            "TLS POSTURE: binding non-loopback address %r with no TLS "
+            "termination (GATEWAY_ALLOW_PLAINTEXT_NONLOOPBACK=1) — per-agent "
+            "secrets cross the network in cleartext. Never use in production.",
+            host,
+        )
+        return
+    raise RuntimeError(
+        f"refusing to bind non-loopback address {host!r} with no TLS "
+        "termination: per-agent secrets would cross the network in "
+        "cleartext (Fix A requires TLS). Set GATEWAY_TLS_TERMINATED=1 "
+        "when a TLS-terminating proxy is in front of the gateway, or "
+        "GATEWAY_ALLOW_PLAINTEXT_NONLOOPBACK=1 for LAN testing only."
+    )
 
 
 def load_settings() -> Settings:
