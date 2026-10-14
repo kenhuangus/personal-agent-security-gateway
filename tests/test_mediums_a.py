@@ -759,3 +759,76 @@ class TestAuditResilience:
         with d2.audit.session() as adb:
             rows = AuditLog(adb).search(tool="email.send")
             assert any(r.request_id == "req_replay_1" for r in rows)
+
+    def test_replay_restores_multiple_rows_sharing_request_id(self, dbs, tmp_path):
+        """GH #35: dedup is on the full stored row, not request_id alone.
+
+        Two distinct audit rows share one request_id (injection-scan
+        event + terminal row). Both must restore after replay, and a
+        second replay must skip both. Exact-duplicate rows still dedupe
+        to one.
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "replay_audit_dead_letter",
+            "scripts/replay_audit_dead_letter.py",
+        )
+        replay_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(replay_mod)
+
+        def _record(row):
+            return json.dumps({
+                "dead_lettered_at": "2026-10-13T00:00:00+00:00",
+                "commit_error": "OperationalError: disk full",
+                "row": row,
+            })
+
+        base = {
+            "request_id": "req_replay_shared",
+            "agent_id": "ag1",
+            "mandate_id": None, "scope_rule": None,
+            "irreversible": False, "irreversible_note": None,
+            "ontology_snapshot_ref": None, "data_snapshot_id": None,
+        }
+        scan_row = {
+            **base,
+            "tool": "email.send", "action": "injection_scan",
+            "timestamp": "2026-10-13T00:00:00+00:00",
+            "decision": "allowed", "reason": "scan_clean",
+            "redacted_args": {"to": ["[redacted:email]"]},
+        }
+        terminal_row = {
+            **base,
+            "tool": "email.send", "action": "",
+            "timestamp": "2026-10-13T00:00:01+00:00",
+            "decision": "allowed", "reason": None,
+            "redacted_args": {"to": ["[redacted:email]"], "subject": "hi"},
+        }
+        dl = tmp_path / "dl_shared.jsonl"
+        dl.write_text(_record(scan_row) + "\n" + _record(terminal_row) + "\n")
+        audit_db_path = str(tmp_path / "audit_shared.db")
+        d2 = Databases(str(tmp_path / "config_shared.db"), audit_db_path)
+        d2.create_all()
+        replayed, skipped, errors = replay_mod.replay(dl, audit_db_path)
+        assert (replayed, skipped, errors) == (2, 0, 0)
+        # Idempotent: a second replay skips both rows, duplicates none.
+        replayed, skipped, errors = replay_mod.replay(dl, audit_db_path)
+        assert (replayed, skipped, errors) == (0, 2, 0)
+        with d2.audit.session() as adb:
+            rows = AuditLog(adb).search(tool="email.send", limit=100)
+            shared = [r for r in rows if r.request_id == "req_replay_shared"]
+            assert len(shared) == 2
+            assert {r.action for r in shared} == {"injection_scan", ""}
+            assert {r.reason for r in shared} == {"scan_clean", None}
+
+        # Exact duplicates still dedupe to a single row.
+        dl_dup = tmp_path / "dl_dup.jsonl"
+        dl_dup.write_text(_record(scan_row) + "\n" + _record(scan_row) + "\n")
+        audit_db_path_dup = str(tmp_path / "audit_dup.db")
+        d3 = Databases(str(tmp_path / "config_dup.db"), audit_db_path_dup)
+        d3.create_all()
+        replayed, skipped, errors = replay_mod.replay(dl_dup, audit_db_path_dup)
+        assert (replayed, skipped, errors) == (1, 1, 0)
+        with d3.audit.session() as adb:
+            rows = AuditLog(adb).search(tool="email.send", limit=100)
+            assert len([r for r in rows if r.request_id == "req_replay_shared"]) == 1

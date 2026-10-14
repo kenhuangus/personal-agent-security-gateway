@@ -3,8 +3,12 @@
 
 Reads ``data/audit-dead-letter.jsonl`` (or the path in
 ``GATEWAY_AUDIT_DEAD_LETTER``) and re-inserts each spilled row into the
-audit DB. Rows are matched by ``request_id`` so a replay is idempotent:
-already-present rows are skipped, not duplicated.
+audit DB. Rows are matched by the full stored row — ``request_id`` +
+``tool`` + ``action`` + ``decision`` + ``reason`` + ``timestamp`` +
+``redacted_args`` — so a replay is idempotent: already-present rows
+are skipped, not duplicated. Matching on ``request_id`` alone would
+lose rows, because several audit rows share one ``request_id`` (e.g.
+an injection-scan event plus the terminal row for the same call).
 
 Usage:
     python3 scripts/replay_audit_dead_letter.py [--dry-run] [--path PATH]
@@ -41,6 +45,40 @@ def _parse_ts(raw: str | None) -> dt.datetime | None:
     return parsed
 
 
+def _row_matches(entry: AuditEntry, row: dict, parsed_ts: dt.datetime | None) -> bool:
+    """True when a stored row is the same audit row as ``row``.
+
+    Compares the full stored row (GH #35): ``request_id`` (already
+    filtered by the caller query) + ``tool`` + ``action`` +
+    ``decision`` + ``reason`` + ``timestamp`` + ``redacted_args``.
+    Comparison happens in Python, not in SQL: JSON equality and
+    timestamp normalization are not portable across DB backends.
+    ``action`` uses the same ``or ""`` normalization as the insert
+    below. A missing/unparseable incoming timestamp cannot be
+    compared, so it does not block a match on the other six fields
+    (dead-letter rows written by ``AuditLog`` always carry one).
+    """
+    if entry.tool != row.get("tool"):
+        return False
+    if entry.action != (row.get("action") or ""):
+        return False
+    if entry.decision != row.get("decision"):
+        return False
+    if entry.reason != row.get("reason"):
+        return False
+    if parsed_ts is not None:
+        stored_ts = entry.timestamp
+        if stored_ts is None:
+            return False
+        if stored_ts.tzinfo is None:
+            stored_ts = stored_ts.replace(tzinfo=dt.timezone.utc)
+        if stored_ts.astimezone(dt.timezone.utc) != parsed_ts.astimezone(dt.timezone.utc):
+            return False
+    if (entry.redacted_args or {}) != (row.get("redacted_args") or {}):
+        return False
+    return True
+
+
 def replay(dead_letter: Path, audit_db_path: str, dry_run: bool = False) -> tuple[int, int, int]:
     """Return (replayed, skipped, errors)."""
     db = Database(audit_db_path)
@@ -57,10 +95,11 @@ def replay(dead_letter: Path, audit_db_path: str, dry_run: bool = False) -> tupl
                 print(f"line {line_no}: unparseable, skipping ({exc})")
                 errors += 1
                 continue
-            exists = session.execute(
+            candidates = session.execute(
                 select(AuditEntry).where(AuditEntry.request_id == row.get("request_id"))
-            ).scalars().first()
-            if exists is not None:
+            ).scalars().all()
+            parsed_ts = _parse_ts(row.get("timestamp"))
+            if any(_row_matches(c, row, parsed_ts) for c in candidates):
                 skipped += 1
                 continue
             if dry_run:
