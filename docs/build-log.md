@@ -2423,3 +2423,59 @@ All four issues verified against the exact code cited before fixing.
 - No secrets/API keys in repo or tests; no model weights committed;
   stealth wording intact (no new OWASP project-status claims).
 - `.github/` untouched (untracked in this tree; not committed).
+
+## 2026-10-15 — Rebase: pillars/two-pillars onto main@8c2025d (rebase coordinator)
+
+Branch `pillars/two-pillars` (MVP: money pack + quorum + finance demo;
+red-team agent runtime) was based on main@85880cf. Main has since moved
+to 8c2025d (all 32 fix-all issues merged, PRs #34–#38). Rebasing:
+`git rebase origin/main` in worktree ~/workspace/mcp-gateway-pillars.
+
+### Conflicts resolved (kept both sides' behavior in every case)
+- `src/gateway/policy.py` — HEAD (#26 tool-selector shape validation)
+  vs branch (money-block structural validation via
+  `money/limits.validate_money_block`): kept both, sequentially.
+- `src/gateway/approval_card.py` — docstring merge: kept the #34
+  `content_hash`-binds-exact-replay-bytes note (issue #3) and the
+  Pillar 1 `money` evidence-inputs note.
+- `src/gateway/config.py` — HEAD (`judge_alert_after_minutes`
+  validation) vs branch (Pillar 1/2 settings validations:
+  `event_interception`, `money_ledger_retention_days`,
+  `webhook_nonce_window_s`, `codehost_issues_backend`,
+  `redteam_issue_threshold`, `sentinel_notify_severity`): kept both.
+- `src/gateway/pipeline.py` — auto-merged cleanly. Verified the #38
+  structure survived: the #32 counterparty hook stays INSIDE #35's
+  try/except-total in ValidateInputsStage (lines ~458–468), and the
+  branch's MoneyStage (step 3.5, after MandateStage) composes with it.
+  The money stage sets `policy_short_circuited`; RealPolicyStage
+  (`policy.py`) skips rule evaluation for decided money calls while
+  the unknown-outcome gate still runs (retry safety).
+
+### Post-rebase fix
+- `tests/test_console_pillars.py::test_money_page_renders` failed:
+  the branch's console-test fixture predates the #5 Secure-cookie
+  fix, so the authed TestClient (plain HTTP) lost its session.
+  Fixed with the main-branch pattern:
+  `GATEWAY_CONSOLE_COOKIE_SECURE=0` in the fixture (commit cce3b54).
+
+### Test evidence
+- Full suite on the rebased branch: **865 passed, 8 skipped**
+  (2026-10-15; the 8 skips are the opt-in live-model tier).
+  Environment: `PYTHONPATH=<worktree>/src` (the venv's editable
+  install points at the main repo — without the override, `gateway.*`
+  imports resolve to main, not the worktree),
+  `TMPDIR=/home/hatch/workspace/.tmp-pytest`; kev-0.8b on
+  127.0.0.1:8009 untouched.
+
+### Non-regression / invariants
+- Fix A (auth wall), Fix B (approval flow + WYSIWYE
+  `preview_redacted` signal), Rego decision contract, fail-closed,
+  judge advisory-only: all hold. The money card renders consequence
+  from structured amount/payee fields (not a redacted free-text
+  preview), so no WYSIWYE gap for `payment.*`; execute-on-approval
+  is disabled for `payment.*` and for quorum requests (re-invoke
+  path only, grant HMAC binds exact amount + payee).
+- No secrets/API keys in repo or tests (the one `sk-live-abc` hit
+  is the pre-existing fixture proving exclusion from the envelope);
+  no model weights committed; stealth wording clean.
+- `.github/` untouched.
