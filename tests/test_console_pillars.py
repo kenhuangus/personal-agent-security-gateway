@@ -31,6 +31,12 @@ ADMIN_PASSWORD = "test-admin-password-1"
 @pytest.fixture()
 def settings(tmp_path, monkeypatch):
     monkeypatch.setenv("GATEWAY_KMS_KEY", generate_kms_key())
+    # The TestClient speaks plain HTTP, and a Secure cookie is never
+    # sent back over HTTP (correct browser behavior) — so the console
+    # integration tests opt out exactly as documented for local HTTP
+    # development (issue #5). The default-true path is covered by
+    # test_session_cookie_secure_flag_defaults_on on main.
+    monkeypatch.setenv("GATEWAY_CONSOLE_COOKIE_SECURE", "0")
     return Settings(
         config_db_path=str(tmp_path / "config.db"),
         audit_db_path=str(tmp_path / "audit.db"),
