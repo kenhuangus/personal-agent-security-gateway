@@ -316,9 +316,16 @@ def _make_tool_fn(
                     "flow disabled (M2 shape); sensitive calls cannot "
                     "complete the approval loop"
                 )
+            # Pillar 1: the money pack's step-3.5 stage (None when the
+            # pack is off — the gateway then behaves exactly as before).
+            money_stage = None
+            if settings.money_enabled:
+                from .money import build_money_stage
+
+                money_stage = build_money_stage(config_db, settings)
             pipeline, _, _ = build_pipeline(
                 config_db, audit_db, settings, hmac_ring, registry=registry,
-                approvals=use_approvals,
+                approvals=use_approvals, money_stage=money_stage,
             )
             outcome = pipeline.execute(agent_id, tool_name, dict(kwargs))
         if outcome.error is not None:
@@ -405,6 +412,49 @@ class GatewayApp:
             from .demo_tools import make_demo_tools
 
             self.register_connector_tools("demo", make_demo_tools())
+
+        # Pillar 1 MVP: the sandbox money pack (payment.*) — registered
+        # when GATEWAY_MONEY_ENABLED=1, invisible otherwise.
+        if self.settings.money_enabled:
+            from .connectors.payment_sandbox import PaymentSandboxConnector
+
+            self.register_connector_tools(
+                "payment",
+                PaymentSandboxConnector(
+                    config_session_factory=self.databases.config.session,
+                    # HOLD fix: GATEWAY_MONEY_DRY_RUN was defined and
+                    # documented but never wired — the kill switch is now
+                    # load-bearing (fail-closed toward dry_run when set).
+                    force_dry_run=self.settings.money_dry_run,
+                ).tools,
+            )
+        # Pillar 2 MVP: the sandbox tool family (red-team target) —
+        # GATEWAY_SANDBOX_TOOLS=1.
+        if self.settings.sandbox_tools:
+            from .connectors.sandbox import SandboxConnector
+
+            self.register_connector_tools("sandbox", SandboxConnector().tools)
+        # Pillar 2 MVP: gateway-side security-agent tools
+        # (audit.search, policy.inspect) — GATEWAY_AGENTS_ENABLED=1.
+        # Registered under their own audit.* / policy.* namespaces
+        # (the arch's tool names), like the gateway.approval_status
+        # meta tool.
+        if self.settings.agents_enabled:
+            from .agent_tools import make_agent_tools
+
+            for tool in make_agent_tools(
+                self.databases.config.session, self.databases.audit.session
+            ):
+                namespace = tool.name.split(".")[0]
+                self.register_connector_tools(namespace, [tool])
+            # The red-team filing tool: codehost.issue_open
+            # (sensitive-gated) on the CodeHostConnector, registered
+            # under its own codehost.* namespace.
+            from .connectors.codehost import CodeHostConnector
+
+            self.register_connector_tools(
+                "codehost", CodeHostConnector().issue_tools
+            )
 
     def _register_tool_on_mcp(self, d: Any) -> None:
         self.mcp.add_tool(

@@ -29,6 +29,7 @@ dependencies = [
     "httpx>=0.27.0",         # connector HTTP + tests
     "jinja2>=3.1.0",         # admin console templates (M2: Agents, Audit Log)
     "pyyaml>=6.0",            # raw YAML policy editor (M6, Policies page)
+    "croniter>=6.0.0",        # security-agent schedule parsing (Pillar 2)
 ]
 
 [project.optional-dependencies]

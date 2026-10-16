@@ -275,6 +275,21 @@ class ApprovalRequest(Base):
     ontology_snapshot_ref: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     ontology_ref: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
+    # Pillar 1 §2 (quorum approvals, migration m001):
+    # approvers needed; 1 = existing single-approver path.
+    quorum_required: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Per-approver slots, append-only: [{admin_id, session_id,
+    # decided_at, approver_index, auth_method}].
+    approvals: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # HMAC(canonical evidence_subset) at creation — the frozen context.
+    evidence_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # {mandate_status, policy_version, counterparty_record_version} at
+    # creation — stale context expires the request (context_changed).
+    context_fingerprint: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # "tool_call" | "event_release" (§4: releasing a quarantined event
+    # follows the same approval flow).
+    request_type: Mapped[str] = mapped_column(String(16), nullable=False, default="tool_call")
+
     __table_args__ = (
         Index("ix_approvals_agent", "agent_id"),
         Index("ix_approvals_status", "status"),
@@ -554,3 +569,181 @@ class ConfigSetting(Base):
     value: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     updated_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# ---------------------------------------------------------------------
+# Pillar 1 — money-movement policy pack (MVP; migration m002)
+# ---------------------------------------------------------------------
+
+class MoneyLedger(Base):
+    """One row per moved payment (Pillar 1 §1.4).
+
+    Written post-execute by the money pack's record hook — denied or
+    failed calls write no row; only moved money consumes budget.
+    ``dry_run=1`` rows exercise the full pipeline including velocity
+    accounting but are excluded from budget sums. Personal-gateway
+    volumes make per-event rows cheap and auditable; rolling windows
+    are SUM/COUNT over indexed occurred_at ranges. Retention: pruned
+    older than GATEWAY_MONEY_LEDGER_RETENTION_DAYS (default 90) via
+    the existing retention job.
+    """
+
+    __tablename__ = "money_ledger"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent_id: Mapped[str] = mapped_column(String(64), ForeignKey("agents.id"), nullable=False)
+    # Set when vault namespaces land (§5); NULL = pre-namespace.
+    namespace_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    mandate_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    counterparty_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    # payment.initiate | payment.cancel
+    tool: Mapped[str] = mapped_column(String(64), nullable=False)
+    # req_ linkage to the audit row.
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    occurred_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_money_ledger_agent", "agent_id"),
+        Index("ix_money_ledger_namespace", "namespace_id"),
+        Index("ix_money_ledger_mandate", "mandate_id"),
+        Index("ix_money_ledger_payee", "counterparty_key"),
+        Index("ix_money_ledger_time", "occurred_at"),
+    )
+
+
+class CounterpartyAllowlist(Base):
+    """Operator-curated counterparty allowlist (Pillar 1 §1.6).
+
+    DISTINCT from the auto-built ``counterparty_records`` (which are
+    written from audited calls, FR-PAA05-001). The allowlist is
+    operator-curated: payee key (account fingerprint), label, details
+    snapshot (last-4 of the operator's own routing/account tails only —
+    the single exception to the no-last-4 rule; full numbers are never
+    stored), and verification state. Edits are data, not rules: they
+    bump ``record_version`` (freezing/expiring in-flight quorum
+    requests via the context check) instead of creating policy
+    versions.
+    """
+
+    __tablename__ = "counterparty_allowlist"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Per-client allowlist (§5); NULL until namespaces land.
+    namespace_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    payee_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    label: Mapped[str] = mapped_column(String(256), nullable=False)
+    details_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # "verified" | "pending" | "blocked".
+    verification_state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    verified_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    verified_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Bumped on every edit; feeds the quorum context freeze (§2.5).
+    record_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    __table_args__ = (
+        Index("ix_allowlist_namespace", "namespace_id"),
+        Index("ix_allowlist_payee", "payee_key"),
+        # (namespace_id, payee_key) is logically unique; the service
+        # layer coalesces NULL namespaces for lookup (SQLite treats
+        # NULL as distinct in unique constraints, so this stays an
+        # index rather than a constraint).
+    )
+
+
+class MoneyPairCooldown(Base):
+    """(agent, payee) denial cooldown (Pillar 1 §1.3).
+
+    Separate from ``RefusalCooldown`` because the key is the payee, not
+    the argument hash. After a deny on (agent, payee), no new approval
+    request for that pair until expiry.
+    """
+
+    __tablename__ = "money_pair_cooldowns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent_id: Mapped[str] = mapped_column(String(64), ForeignKey("agents.id"), nullable=False)
+    counterparty_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id", "counterparty_key", name="uq_money_pair_cooldown"
+        ),
+        Index("ix_money_pair_cooldown_lookup", "agent_id", "counterparty_key"),
+    )
+
+
+# ---------------------------------------------------------------------
+# Pillar 2 — security-agent runtime state (MVP: red-team agent)
+# ---------------------------------------------------------------------
+
+class AgentSchedule(Base):
+    """One schedule row per security agent (Pillar 2 §1.3).
+
+    Cron-driven via croniter; the console "Run now" inserts an
+    ``agent_runs`` row with trigger='manual'. Schedules seed with
+    ``enabled=False`` — no security agent runs until the operator
+    starts it (default-off). ``config`` holds per-agent JSON (scenario
+    checkboxes, rate limits, severity threshold, daily cap).
+    """
+
+    __tablename__ = "agent_schedules"
+
+    agent_id: Mapped[str] = mapped_column(String(64), ForeignKey("agents.id"), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Cron expression (e.g. "0 2 * * *") or "interval" for interval agents.
+    cron_expr: Mapped[str] = mapped_column(String(64), nullable=False, default="0 2 * * *")
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="America/New_York")
+    interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    next_run_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AgentRun(Base):
+    """One dispatched agent run (Pillar 2 §1.3)."""
+
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # run_… id
+    agent_id: Mapped[str] = mapped_column(String(64), ForeignKey("agents.id"), nullable=False)
+    # "scheduled" | "manual" | "global_stop" | "redteam_critical"
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False, default="scheduled")
+    # "requested" | "running" | "ok" | "findings" | "error" | "stopped" | "rate_limited"
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="requested")
+    started_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[dt.datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    run_log: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    input: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        Index("ix_agent_runs_agent", "agent_id"),
+        Index("ix_agent_runs_status", "status"),
+    )
+
+
+class AgentHeartbeat(Base):
+    """Heartbeat after every run and every scheduler tick for interval
+    agents (Pillar 2 §1.4). The fleet dashboard's health rule reads the
+    latest row per agent: >2× interval amber, >5× red + banner."""
+
+    __tablename__ = "agent_heartbeats"
+
+    agent_id: Mapped[str] = mapped_column(String(64), ForeignKey("agents.id"), primary_key=True)
+    run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # ok | findings | error | denied | mandate_missing |
+    # mandate_forbidden | credential_missing | paused | stopped
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="ok")
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    ts: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )

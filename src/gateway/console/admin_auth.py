@@ -45,6 +45,18 @@ from ..config import Settings
 from ..models import AdminUser, as_utc
 
 SESSION_COOKIE = "gw_admin"
+
+
+def session_id_for_token(token: Optional[str]) -> Optional[str]:
+    """Per-login session id for distinct-session quorum enforcement.
+
+    SHA-256 of the full signed session token: stable within one login,
+    distinct across logins (each login issues a fresh token). Never
+    the admin id itself, and never reversible to the token.
+    """
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 ADMIN_ID = "admin_ken"  # single admin = Ken (02 §3.3); admin_id seam kept
 
 _LOCKOUT_BASE_MINUTES = 1

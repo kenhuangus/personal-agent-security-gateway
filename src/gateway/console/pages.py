@@ -147,6 +147,25 @@ def register_dashboard(
         received_at = _utcnow()
         items: list[dict[str, Any]] = []
         with config_session_factory() as db:
+            # Pillar 2: persist the global-stop flag so the
+            # agents-runner (a separate process) sees it on its next
+            # tick. Cleared explicitly from the Security Agents page —
+            # never auto-cleared.
+            from ..models import ConfigSetting
+
+            flag = db.get(ConfigSetting, "global_stop")
+            flag_value = {
+                "engaged": True,
+                "at": received_at.isoformat(),
+                "by": "admin_ken",
+            }
+            if flag is None:
+                db.add(ConfigSetting(key="global_stop", value=flag_value,
+                                     updated_by="admin_ken"))
+            else:
+                flag.value = flag_value
+                flag.updated_at = _utcnow()
+                flag.updated_by = "admin_ken"
             identity = IdentityService(db)
             agents = db.query(Agent).order_by(Agent.id).all()
             for a in agents:

@@ -2423,3 +2423,97 @@ All four issues verified against the exact code cited before fixing.
 - No secrets/API keys in repo or tests; no model weights committed;
   stealth wording intact (no new OWASP project-status claims).
 - `.github/` untouched (untracked in this tree; not committed).
+
+## 2026-10-15 — Rebase: pillars/two-pillars onto main@8c2025d (rebase coordinator)
+
+Branch `pillars/two-pillars` (MVP: money pack + quorum + finance demo;
+red-team agent runtime) was based on main@85880cf. Main has since moved
+to 8c2025d (all 32 fix-all issues merged, PRs #34–#38). Rebasing:
+`git rebase origin/main` in worktree ~/workspace/mcp-gateway-pillars.
+
+### Conflicts resolved (kept both sides' behavior in every case)
+- `src/gateway/policy.py` — HEAD (#26 tool-selector shape validation)
+  vs branch (money-block structural validation via
+  `money/limits.validate_money_block`): kept both, sequentially.
+- `src/gateway/approval_card.py` — docstring merge: kept the #34
+  `content_hash`-binds-exact-replay-bytes note (issue #3) and the
+  Pillar 1 `money` evidence-inputs note.
+- `src/gateway/config.py` — HEAD (`judge_alert_after_minutes`
+  validation) vs branch (Pillar 1/2 settings validations:
+  `event_interception`, `money_ledger_retention_days`,
+  `webhook_nonce_window_s`, `codehost_issues_backend`,
+  `redteam_issue_threshold`, `sentinel_notify_severity`): kept both.
+- `src/gateway/pipeline.py` — auto-merged cleanly. Verified the #38
+  structure survived: the #32 counterparty hook stays INSIDE #35's
+  try/except-total in ValidateInputsStage (lines ~458–468), and the
+  branch's MoneyStage (step 3.5, after MandateStage) composes with it.
+  The money stage sets `policy_short_circuited`; RealPolicyStage
+  (`policy.py`) skips rule evaluation for decided money calls while
+  the unknown-outcome gate still runs (retry safety).
+
+### Post-rebase fix
+- `tests/test_console_pillars.py::test_money_page_renders` failed:
+  the branch's console-test fixture predates the #5 Secure-cookie
+  fix, so the authed TestClient (plain HTTP) lost its session.
+  Fixed with the main-branch pattern:
+  `GATEWAY_CONSOLE_COOKIE_SECURE=0` in the fixture (commit cce3b54).
+
+### Test evidence
+- Full suite on the rebased branch: **865 passed, 8 skipped**
+  (2026-10-15; the 8 skips are the opt-in live-model tier).
+  Environment: `PYTHONPATH=<worktree>/src` (the venv's editable
+  install points at the main repo — without the override, `gateway.*`
+  imports resolve to main, not the worktree),
+  `TMPDIR=/home/hatch/workspace/.tmp-pytest`; kev-0.8b on
+  127.0.0.1:8009 untouched.
+
+### Non-regression / invariants
+- Fix A (auth wall), Fix B (approval flow + WYSIWYE
+  `preview_redacted` signal), Rego decision contract, fail-closed,
+  judge advisory-only: all hold. The money card renders consequence
+  from structured amount/payee fields (not a redacted free-text
+  preview), so no WYSIWYE gap for `payment.*`; execute-on-approval
+  is disabled for `payment.*` and for quorum requests (re-invoke
+  path only, grant HMAC binds exact amount + payee).
+- No secrets/API keys in repo or tests (the one `sk-live-abc` hit
+  is the pre-existing fixture proving exclusion from the envelope);
+  no model weights committed; stealth wording clean.
+- `.github/` untouched.
+
+## 2026-10-16 — Fix-back: PR #39 security review HOLDs (8 fixes)
+
+Branch `pillars/two-pillars`. All five HOLDs + three required fixes
+from the PR #39 security review, fixed without redesign. 20 new
+regression tests in `tests/test_money_hold_fixes.py`.
+
+- **HOLD 1 (blocked-payee bypass):** new
+  `money/allowlist.canonicalize_payee_key()` (lower + strip), applied
+  at every boundary: `AllowlistService.add` / `set_verification` /
+  `lookup`, `MoneyStage` entry (`stage.py`), `dry_run_decision`
+  (`limits.py`), the approval-request `context_fingerprint`
+  (`approvals.py`), and the sandbox ledger write
+  (`payment_sandbox.py:_initiate`). Case/whitespace variation can no
+  longer evade a block or split velocity/cooldown windows.
+- **HOLD 2 (spend-cap bypass):** `GrantService.check` re-verifies money
+  grants at consumption via `money.limits.reverify_money_grant`
+  (fail-closed, before the atomic consume). New `committed_cents` on
+  `MoneyState` (live grants as budget reservations, excludable via
+  `exclude_committed_request_id`); the ladder cap checks and the
+  card's remaining budget net out executed + committed + current.
+  `evaluate()` takes `include_committed` (dry-run passes False).
+- **HOLD 3 (post-approval allowlist change):** the same re-verification
+  denies `counterparty_blocked` / `money_context_changed`
+  (record_version drift or entry removal vs the fingerprint). The
+  false `quorum.py` docstring and `docs/pillar1-finance-arch.md` §2.5
+  now describe the actual consumption-time mechanism.
+- **HOLD 4 (dry-run kill switch):** `mcp_server.py` wires
+  `settings.money_dry_run` → `PaymentSandboxConnector(force_dry_run=…)`.
+- **HOLD 5 (issue-store traversal):** `_check_repo` rejects `.` / `..`
+  / empty components explicitly; stale comment corrected.
+- **Required:** grant-mismatch check after live-grant check (no false
+  mismatch on concurrent approvals; tamper detection intact);
+  `payment.cancel` re-invokes consume the live grant (loop closed);
+  `AgentCredentials.raw_secret` gets `repr=False`.
+- Invariants held: Fix A/B (+WYSIWYE), Rego contract, fail-closed,
+  judge advisory-only, no secrets/weights, stealth wording,
+  `.github/` untouched.
