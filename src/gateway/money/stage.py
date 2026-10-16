@@ -43,6 +43,7 @@ from sqlalchemy.orm import Session
 from ..config import Settings
 from ..errors import GatewayError, invalid_input, make_error, policy_denied
 from ..pipeline import timing_span
+from .allowlist import canonicalize_payee_key
 from .amounts import AmountError, canonicalize_amount
 from .limits import (
     detect_grant_mismatch,
@@ -87,6 +88,25 @@ class MoneyStage:
         # amount thresholds do not apply. The amount is resolved from
         # the referenced receipt at card-render time.
         if ctx.tool == "payment.cancel":
+            # Approved re-invoke first (required fix): a live grant with
+            # a matching hash means the policy stage's grant checker
+            # consumes it. Without this, every post-approval re-invoke
+            # minted a NEW approval request (infinite approval loop).
+            if ctx.argument_hash is not None:
+                if has_live_grant(
+                    self.db, ctx.agent_id, ctx.tool, ctx.argument_hash
+                ):
+                    return None
+                if detect_grant_mismatch(
+                    self.db, ctx.agent_id, ctx.tool, ctx.argument_hash
+                ):
+                    return make_error(
+                        "grant_argument_mismatch",
+                        f"{ctx.tool}: re-invoked arguments do not match the approved "
+                        "grant; start a new approval request",
+                        ctx.request_id,
+                        {"tool": ctx.tool, "reason": "grant_argument_mismatch"},
+                    )
             found = find_money_rule(
                 self.db, ctx.agent, ctx.tool, ctx.args,
                 getattr(ctx.mandate, "purpose_key", None) if ctx.mandate else None,
@@ -107,7 +127,10 @@ class MoneyStage:
             # approval created. (ValidateInputsStage already enforced
             # the shape; this is the second check.)
             return invalid_input(ctx.request_id, "amount_cents", tool=ctx.tool)
-        payee_key = str(ctx.args.get("payee_key") or "")
+        payee_key = canonicalize_payee_key(str(ctx.args.get("payee_key") or ""))
+        # Canonical form (lower + strip): the allowlist, velocity
+        # windows, and pair cooldowns all key on this — a blocked payee
+        # cannot be evaded by case/whitespace variation.
 
         # Grant-mismatch guard (§1.2): post-approval re-invoke with a
         # different amount/payee misses the grant's argument HMAC →
@@ -115,7 +138,15 @@ class MoneyStage:
         # call is the approved re-invoke: the ladder does NOT re-decide
         # and the policy stage is NOT short-circuited, so the grant
         # checker (grant-before-rule) consumes the grant.
+        #
+        # Order matters (required fix): the live-grant check runs FIRST.
+        # Two legitimate concurrent approvals for the same (agent, tool)
+        # with different args each hold a live grant; checking mismatch
+        # first would falsely deny the re-invoke whose hash matches its
+        # own grant.
         if ctx.argument_hash is not None:
+            if has_live_grant(self.db, ctx.agent_id, ctx.tool, ctx.argument_hash):
+                return None
             if detect_grant_mismatch(
                 self.db, ctx.agent_id, ctx.tool, ctx.argument_hash
             ):
@@ -126,8 +157,6 @@ class MoneyStage:
                     ctx.request_id,
                     {"tool": ctx.tool, "reason": "grant_argument_mismatch"},
                 )
-            if has_live_grant(self.db, ctx.agent_id, ctx.tool, ctx.argument_hash):
-                return None
 
         found = find_money_rule(
             self.db, ctx.agent, ctx.tool, ctx.args,

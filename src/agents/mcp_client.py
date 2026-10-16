@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import base64
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 #: agent key → (credential env var, credential-id env var).
@@ -54,7 +54,7 @@ class AgentCredentials:
     # raw_secret: the raw secret. NEVER logged, persisted, displayed,
     # or included in the repr — it only travels into the Authorization
     # header built by build_authorization_header().
-    raw_secret: str = ""
+    raw_secret: str = field(default="", repr=False)
 
 
 def load_agent_credentials(agent_key: str) -> AgentCredentials:

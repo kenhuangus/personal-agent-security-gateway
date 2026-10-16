@@ -5,7 +5,8 @@ Decision: SQLite table (``money_ledger``), not in-memory. Precedent:
 limits" — spend limits have the same requirement, more so.
 
 ``MoneyStateBuilder.build`` returns one snapshot per call: three
-indexed aggregate queries over ``money_ledger``. Rolling windows are
+indexed aggregate queries over ``money_ledger`` plus one indexed query
+over live ``grants`` (committed budget reservations). Rolling windows are
 computed server-side from UTC ``occurred_at`` (no client time
 trusted). ``dry_run=1`` rows are excluded from budget sums but
 included in velocity counts — a dry-run flood is still a flood.
@@ -25,10 +26,59 @@ from typing import Any, Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..models import MoneyLedger, as_utc, utcnow
+from ..models import ApprovalRequest, Grant, MoneyLedger, as_utc, utcnow
 
 #: Money tools whose successful execution appends a ledger row.
 LEDGER_TOOLS: frozenset[str] = frozenset({"payment.initiate", "payment.cancel"})
+
+#: Grant tools whose live grants count as committed budget reservations.
+#: Only payment.initiate carries an amount; payment.cancel reverses.
+COMMITTED_GRANT_TOOLS: frozenset[str] = frozenset({"payment.initiate"})
+
+
+def live_committed_cents(
+    db: Session,
+    agent_id: str,
+    now: dt.datetime,
+    *,
+    exclude_approval_request_id: Optional[str] = None,
+) -> int:
+    """Sum of amounts on live payment.initiate grants for the agent.
+
+    A grant is live when unconsumed, uninvalidated, and unexpired.
+    Amounts come from the approval request's redacted args (int cents;
+    non-int/missing amounts are skipped — fail-closed is handled by
+    the caller, which denies unverifiable grants outright).
+
+    ``exclude_approval_request_id``: at grant consumption the consuming
+    grant itself is still live — exclude it to avoid double-counting
+    its amount as both committed and current.
+    """
+    total = 0
+    rows = (
+        db.execute(
+            select(Grant).where(
+                Grant.agent_id == agent_id,
+                Grant.tool.in_(COMMITTED_GRANT_TOOLS),
+                Grant.consumed.is_(False),
+                Grant.invalidated.is_(False),
+                Grant.expires_at > now,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for grant in rows:
+        if (
+            exclude_approval_request_id is not None
+            and grant.approval_request_id == exclude_approval_request_id
+        ):
+            continue
+        apr = db.get(ApprovalRequest, grant.approval_request_id)
+        amt = (apr.redacted_args or {}).get("amount_cents") if apr else None
+        if isinstance(amt, int) and not isinstance(amt, bool) and amt > 0:
+            total += amt
+    return total
 
 
 @dataclass(frozen=True)
@@ -37,6 +87,11 @@ class MoneyState:
 
     spent_today_cents: int
     spent_month_cents: int
+    #: Approved-but-not-yet-executed amounts (live payment.initiate
+    #: grants). Reservations against the caps: the card's remaining
+    #: budget and the consumption-time re-verification both count them
+    #: (HOLD fix #2 — concurrent approvals must not overshoot the cap).
+    committed_cents: int
     payments_last_hour: int
     payments_today: int
     payee_payments_last_hour: int
@@ -107,6 +162,8 @@ class MoneyStateBuilder:
         now: dt.datetime,
         *,
         allowlisted_keys: Optional[set[str]] = None,
+        include_committed: bool = True,
+        exclude_committed_request_id: Optional[str] = None,
     ) -> MoneyState:
         now = as_utc(now) or now
         day_start = now - dt.timedelta(days=1)
@@ -116,6 +173,16 @@ class MoneyStateBuilder:
 
         spent_today = _sum_since(self.db, agent_id, namespace_id, day_start)
         spent_month = _sum_since(self.db, agent_id, namespace_id, month_start)
+        committed = (
+            live_committed_cents(
+                self.db,
+                agent_id,
+                now,
+                exclude_approval_request_id=exclude_committed_request_id,
+            )
+            if include_committed
+            else 0
+        )
         payments_hour = _count_since(self.db, agent_id, namespace_id, hour_start)
         payments_today = _count_since(self.db, agent_id, namespace_id, day_start)
         payee_hour = _count_since(
@@ -167,6 +234,7 @@ class MoneyStateBuilder:
         return MoneyState(
             spent_today_cents=spent_today,
             spent_month_cents=spent_month,
+            committed_cents=committed,
             payments_last_hour=payments_hour,
             payments_today=payments_today,
             payee_payments_last_hour=payee_hour,

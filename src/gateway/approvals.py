@@ -230,6 +230,33 @@ class GrantService:
                     mandate_id=grant.mandate_id,
                     deny_reason="policy_superseded",
                 )
+            # Pillar 1 money re-verification (HOLD fixes #2, #3): the
+            # ladder decides on a ledger snapshot at approval-request
+            # time, but concurrent approvals can each pass against a
+            # stale snapshot and the allowlist can change post-approval.
+            # Re-verify spend caps + allowlist state at consumption,
+            # fail-closed, before the atomic consume.
+            if tool == "payment.initiate":
+                from .money.limits import reverify_money_grant
+
+                money_deny = reverify_money_grant(db, grant, now)
+                if money_deny is not None:
+                    self.audit.append(
+                        agent_id=agent_id,
+                        tool=tool,
+                        decision="denied",
+                        reason=money_deny,
+                        approval_request_id=grant.approval_request_id,
+                        mandate_id=grant.mandate_id,
+                        redacted_args={"money_reverify": True},
+                    )
+                    db.commit()
+                    return GrantCheckResult(
+                        allowed=False,
+                        approval_request_id=grant.approval_request_id,
+                        mandate_id=grant.mandate_id,
+                        deny_reason=money_deny,
+                    )
             # Atomic compare-and-consume: the UPDATE only matches an
             # unconsumed, uninvalidated row. Concurrent re-invokes:
             # first wins, second sees rowcount 0 → already_executed.
@@ -604,9 +631,15 @@ class ApprovalService:
         payee_key = None
         allowlist_version = None
         if ctx.tool.startswith("payment."):
-            from .money.allowlist import AllowlistService
+            from .money.allowlist import AllowlistService, canonicalize_payee_key
 
-            payee_key = str((ctx.args or {}).get("payee_key") or "") or None
+            # Canonical form (HOLD fix): the fingerprint's payee_key
+            # must match the canonicalized allowlist keys, or the
+            # consumption-time record_version check compares apples to
+            # oranges.
+            payee_key = canonicalize_payee_key(
+                str((ctx.args or {}).get("payee_key") or "")
+            ) or None
             if payee_key:
                 allowlist_version = AllowlistService(self.db).record_version_of(
                     None, payee_key

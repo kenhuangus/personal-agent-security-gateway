@@ -26,9 +26,13 @@ Evidence freeze: at request creation ``evidence_hash =
 HMAC(canonical evidence_subset)`` and ``context_fingerprint =
 {mandate_status, policy_version, payee_key, counterparty_record_version,
 namespace_id}``. ``check_context`` runs (a) inside ``sweep_expired``,
-(b) before each ``record_approval``, (c) at grant consumption for
-quorum grants: stale context → ``expired`` / ``context_changed``.
-Approvers never sign stale context.
+(b) before each ``record_approval``: stale context → ``expired`` /
+``context_changed``. (c) At grant consumption,
+``GrantService.check`` re-verifies money grants via
+``money.limits.reverify_money_grant`` (spend caps against the fresh
+ledger + committed reservations, allowlist blocked/record-version) —
+stale or blocked → deny, fail-closed. Approvers never sign stale
+context, and stale grants never execute.
 """
 
 from __future__ import annotations

@@ -299,11 +299,13 @@ Identical to the single-approver grant (MF-7): one-time, 30-min TTL, bound to `(
 
 At request creation: `evidence_hash = ring.digest(canonical(evidence_subset))`; `context_fingerprint = {mandate_status, policy_version: current, counterparty_record_version: allowlist.record_version}`.
 
-`quorum.check_context(db, apr)` runs (a) inside `sweep_expired`, (b) before each `record_approval`, (c) at grant consumption for quorum grants:
+`quorum.check_context(db, apr)` runs (a) inside `sweep_expired`, (b) before each `record_approval`:
 
 - mandate not live (withdrawn/paused/expired) → `expired`, reason `context_changed`
 - current policy version > `apr.policy_version` with a **material** change → `expired` / `context_changed` (non-material changes do not expire — matches MF-7 grant semantics)
 - allowlist `record_version` for the payee != fingerprinted version → `expired` / `context_changed`
+
+(c) At grant consumption, `GrantService.check` re-verifies money grants via `money.limits.reverify_money_grant`: spend caps against the fresh ledger plus committed reservations, and allowlist blocked/record-version — stale or blocked → deny, fail-closed. (This is the consumption-time enforcement; `check_context` itself is not called on the grant path.)
 
 Expiry audit-logs both approver slots' admin ids and notifies in-console. Approvers never sign stale context.
 

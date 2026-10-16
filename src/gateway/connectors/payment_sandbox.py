@@ -41,6 +41,7 @@ from typing import Any, Callable, Optional
 from sqlalchemy.orm import Session
 
 from ..ids import new_payment_id
+from ..money.allowlist import canonicalize_payee_key
 from ..money.amounts import AmountError, canonicalize_amount, format_cents
 from ..money.state import LEDGER_TOOLS, record_movement
 from ..pipeline import ToolDescriptor
@@ -233,7 +234,10 @@ class PaymentSandboxConnector(Connector):
     def _initiate(self, ctx: Any, args: dict[str, Any]) -> Any:
         self._token(ctx)
         amount_cents = canonicalize_amount(args)  # validated upstream; fail closed
-        payee_key = str(args["payee_key"])
+        # Canonical form (HOLD fix): the ledger's counterparty_key must
+        # match the allowlist/velocity keys, or windows split across
+        # key spellings.
+        payee_key = canonicalize_payee_key(str(args["payee_key"]))
         dry_run = bool(args.get("dry_run", False)) or self.force_dry_run
         receipt = self.upstream.initiate(
             amount_cents=amount_cents, payee_key=payee_key, dry_run=dry_run

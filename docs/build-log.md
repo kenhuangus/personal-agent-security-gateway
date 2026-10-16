@@ -2479,3 +2479,41 @@ to 8c2025d (all 32 fix-all issues merged, PRs #34–#38). Rebasing:
   is the pre-existing fixture proving exclusion from the envelope);
   no model weights committed; stealth wording clean.
 - `.github/` untouched.
+
+## 2026-10-16 — Fix-back: PR #39 security review HOLDs (8 fixes)
+
+Branch `pillars/two-pillars`. All five HOLDs + three required fixes
+from the PR #39 security review, fixed without redesign. 20 new
+regression tests in `tests/test_money_hold_fixes.py`.
+
+- **HOLD 1 (blocked-payee bypass):** new
+  `money/allowlist.canonicalize_payee_key()` (lower + strip), applied
+  at every boundary: `AllowlistService.add` / `set_verification` /
+  `lookup`, `MoneyStage` entry (`stage.py`), `dry_run_decision`
+  (`limits.py`), the approval-request `context_fingerprint`
+  (`approvals.py`), and the sandbox ledger write
+  (`payment_sandbox.py:_initiate`). Case/whitespace variation can no
+  longer evade a block or split velocity/cooldown windows.
+- **HOLD 2 (spend-cap bypass):** `GrantService.check` re-verifies money
+  grants at consumption via `money.limits.reverify_money_grant`
+  (fail-closed, before the atomic consume). New `committed_cents` on
+  `MoneyState` (live grants as budget reservations, excludable via
+  `exclude_committed_request_id`); the ladder cap checks and the
+  card's remaining budget net out executed + committed + current.
+  `evaluate()` takes `include_committed` (dry-run passes False).
+- **HOLD 3 (post-approval allowlist change):** the same re-verification
+  denies `counterparty_blocked` / `money_context_changed`
+  (record_version drift or entry removal vs the fingerprint). The
+  false `quorum.py` docstring and `docs/pillar1-finance-arch.md` §2.5
+  now describe the actual consumption-time mechanism.
+- **HOLD 4 (dry-run kill switch):** `mcp_server.py` wires
+  `settings.money_dry_run` → `PaymentSandboxConnector(force_dry_run=…)`.
+- **HOLD 5 (issue-store traversal):** `_check_repo` rejects `.` / `..`
+  / empty components explicitly; stale comment corrected.
+- **Required:** grant-mismatch check after live-grant check (no false
+  mismatch on concurrent approvals; tamper detection intact);
+  `payment.cancel` re-invokes consume the live grant (loop closed);
+  `AgentCredentials.raw_secret` gets `repr=False`.
+- Invariants held: Fix A/B (+WYSIWYE), Rego contract, fail-closed,
+  judge advisory-only, no secrets/weights, stealth wording,
+  `.github/` untouched.

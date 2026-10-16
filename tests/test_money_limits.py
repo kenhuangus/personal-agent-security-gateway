@@ -40,6 +40,7 @@ class _FakeState:
     def __init__(self, **kw):
         self.spent_today_cents = kw.get("spent_today_cents", 0)
         self.spent_month_cents = kw.get("spent_month_cents", 0)
+        self.committed_cents = kw.get("committed_cents", 0)
         self.payments_last_hour = kw.get("payments_last_hour", 0)
         self.payments_today = kw.get("payments_today", 0)
         self.payee_payments_last_hour = kw.get("payee_payments_last_hour", 0)

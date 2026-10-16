@@ -421,7 +421,11 @@ class GatewayApp:
             self.register_connector_tools(
                 "payment",
                 PaymentSandboxConnector(
-                    config_session_factory=self.databases.config.session
+                    config_session_factory=self.databases.config.session,
+                    # HOLD fix: GATEWAY_MONEY_DRY_RUN was defined and
+                    # documented but never wired — the kill switch is now
+                    # load-bearing (fail-closed toward dry_run when set).
+                    force_dry_run=self.settings.money_dry_run,
                 ).tools,
             )
         # Pillar 2 MVP: the sandbox tool family (red-team target) —

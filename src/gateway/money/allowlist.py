@@ -29,6 +29,18 @@ STATE_VERIFIED = "verified"
 STATE_PENDING = "pending"
 STATE_BLOCKED = "blocked"
 
+
+def canonicalize_payee_key(payee_key: str) -> str:
+    """Canonical form for payee keys (HOLD fix: blocked-payee bypass).
+
+    Lowercase + strip. Every allowlist write and read goes through
+    this, so ``ACH:irs:xxxx1234`` and ``ach:irs:xxxx1234`` are the same
+    payee: a blocked payee cannot be evaded by case/whitespace
+    variation, and per-payee velocity windows / pair cooldowns cannot
+    be split across key spellings.
+    """
+    return (payee_key or "").strip().lower()
+
 _VALID_STATES = (STATE_VERIFIED, STATE_PENDING, STATE_BLOCKED)
 
 
@@ -41,6 +53,7 @@ class AllowlistService:
     def lookup(
         self, namespace_id: Optional[str], payee_key: str
     ) -> Optional[CounterpartyAllowlist]:
+        payee_key = canonicalize_payee_key(payee_key)
         return self.db.execute(
             select(CounterpartyAllowlist).where(
                 (
@@ -78,6 +91,7 @@ class AllowlistService:
     ) -> CounterpartyAllowlist:
         if verification_state not in _VALID_STATES:
             raise ValueError(f"unknown verification state {verification_state!r}")
+        payee_key = canonicalize_payee_key(payee_key)
         existing = self.lookup(namespace_id, payee_key)
         if existing is not None:
             raise ValueError(f"payee {payee_key!r} already allowlisted")
@@ -108,6 +122,7 @@ class AllowlistService:
     ) -> CounterpartyAllowlist:
         if verification_state not in _VALID_STATES:
             raise ValueError(f"unknown verification state {verification_state!r}")
+        payee_key = canonicalize_payee_key(payee_key)
         row = self.lookup(namespace_id, payee_key)
         if row is None:
             raise ValueError(f"payee {payee_key!r} not allowlisted")

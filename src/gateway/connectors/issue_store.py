@@ -42,6 +42,12 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 def _check_repo(repo: str) -> None:
     if not _REPO_RE.match(repo or ""):
         raise ValueError(f"invalid repo {repo!r}; want 'owner/name'")
+    # The character class above permits dots, so ".." components pass
+    # the regex — reject traversal explicitly (HOLD fix: "../.." must
+    # never reach the filesystem).
+    owner, name = repo.split("/", 1)
+    if owner in ("", ".", "..") or name in ("", ".", ".."):
+        raise ValueError(f"invalid repo {repo!r}; path components not allowed")
 
 
 class LocalIssueStore:
@@ -61,8 +67,9 @@ class LocalIssueStore:
     def _repo_dir(self, repo: str) -> str:
         _check_repo(repo)
         owner, name = repo.split("/", 1)
-        # owner/name are constrained by _REPO_RE (no path separators
-        # beyond the one split) — no traversal possible.
+        # owner/name are constrained by _check_repo (charset + explicit
+        # rejection of ".", "..", and empty components) — no traversal
+        # possible.
         path = os.path.join(self.root_dir, owner, name)
         os.makedirs(path, exist_ok=True)
         return path

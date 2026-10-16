@@ -31,13 +31,21 @@ from typing import Any, Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..models import Grant, MoneyPairCooldown, PolicyRule, as_utc, utcnow
+from ..models import (
+    ApprovalRequest,
+    Grant,
+    MoneyPairCooldown,
+    PolicyRule,
+    as_utc,
+    utcnow,
+)
 from ..policy import rule_matches
 from .allowlist import (
     STATE_BLOCKED,
     STATE_PENDING,
     STATE_VERIFIED,
     AllowlistService,
+    canonicalize_payee_key,
 )
 from .amounts import format_cents
 from .state import MoneyState, MoneyStateBuilder
@@ -188,13 +196,32 @@ def _card_evidence(
     card: dict[str, Any] = {
         "amount": format_cents(amount_cents),
         "payee_key": payee_key,
+        # Remaining budget nets out executed spend, committed
+        # reservations (live grants), and this call — approvers see
+        # the true headroom (HOLD fix #2).
         "remaining_daily": (
-            format_cents(max(0, per_day - state.spent_today_cents - amount_cents))
+            format_cents(
+                max(
+                    0,
+                    per_day
+                    - state.spent_today_cents
+                    - state.committed_cents
+                    - amount_cents,
+                )
+            )
             if per_day is not None
             else None
         ),
         "remaining_monthly": (
-            format_cents(max(0, per_month - state.spent_month_cents - amount_cents))
+            format_cents(
+                max(
+                    0,
+                    per_month
+                    - state.spent_month_cents
+                    - state.committed_cents
+                    - amount_cents,
+                )
+            )
             if per_month is not None
             else None
         ),
@@ -221,14 +248,22 @@ def evaluate(
     block: dict[str, Any],
     now: Optional[dt.datetime] = None,
     namespace_id: Optional[str] = None,
+    include_committed: bool = True,
 ) -> MoneyDecision:
-    """Run the fixed threshold ladder (§1.5 step 6)."""
+    """Run the fixed threshold ladder (§1.5 step 6).
+
+    ``include_committed``: count live (approved, unconsumed) money
+    grants as budget reservations. True at approval-request time (the
+    card's remaining budget and the ladder both see committed money);
+    False for historical dry-run evaluation.
+    """
     now = now or utcnow()
     allowlist = AllowlistService(db)
     allowlist_row = allowlist.lookup(namespace_id, payee_key)
     state = MoneyStateBuilder(db).build(
         agent.id, namespace_id, payee_key, now,
         allowlisted_keys=allowlist.keys(namespace_id),
+        include_committed=include_committed,
     )
 
     def decide(decision: str, reason: Optional[str], new_cp: bool) -> MoneyDecision:
@@ -254,12 +289,19 @@ def evaluate(
     # (b) blocked payee.
     if allowlist_row is not None and allowlist_row.verification_state == STATE_BLOCKED:
         return decide("deny", "counterparty_blocked", False)
-    # (c) rolling spend caps.
+    # (c) rolling spend caps (executed + committed reservations +
+    # this call — concurrent approvals cannot overshoot the cap).
     per_day = block.get("per_day_cents")
-    if per_day is not None and state.spent_today_cents + amount_cents > per_day:
+    if (
+        per_day is not None
+        and state.spent_today_cents + state.committed_cents + amount_cents > per_day
+    ):
         return decide("deny", "spend_cap_exceeded", state.is_new_counterparty)
     per_month = block.get("per_month_cents")
-    if per_month is not None and state.spent_month_cents + amount_cents > per_month:
+    if (
+        per_month is not None
+        and state.spent_month_cents + state.committed_cents + amount_cents > per_month
+    ):
         return decide("deny", "spend_cap_exceeded", state.is_new_counterparty)
     # (d) velocity hard-stops: per-agent window and per-payee window
     # independently (split-payment evasion), plus per-day and the
@@ -320,7 +362,7 @@ def dry_run_decision(
         # never apply.
         return "require_approval"
     amount_cents = args.get("amount_cents")
-    payee_key = str(args.get("payee_key") or "")
+    payee_key = canonicalize_payee_key(str(args.get("payee_key") or ""))
     found = find_money_rule(
         db, agent, tool, args, purpose, policy_version=policy_version
     )
@@ -334,6 +376,9 @@ def dry_run_decision(
         db=db, agent=agent, tool=tool, args=args,
         amount_cents=amount_cents, payee_key=payee_key,
         rule=rule, block=block, now=as_of,
+        # Historical evaluation: live grants *now* are irrelevant
+        # as-of *as_of*.
+        include_committed=False,
     )
     return decision.decision
 
@@ -409,6 +454,116 @@ def has_live_grant(
         .first()
     )
     return row is not None
+
+
+# ---------------------------------------------------------------------
+# Grant-consumption re-verification (HOLD fixes #2 and #3).
+#
+# The ladder decides on a ledger snapshot at approval-request time.
+# Between approval and execution two things can invalidate it:
+# concurrent approvals each passing against a stale snapshot (#2),
+# and operator allowlist changes (block / verification / removal)
+# after approval (#3). The grant checker calls
+# ``reverify_money_grant`` at consumption — after the mandate and
+# policy-supersession checks, before the atomic consume — and denies
+# fail-closed when the world moved.
+#
+# Only the hard DENY conditions are re-checked (spend caps, blocked
+# payee, allowlist staleness). Step-up conditions (unlisted payee,
+# soft threshold) are NOT re-decided: the grant already carries its
+# approval, and re-stepping-up at consumption would deny legitimate
+# approved calls.
+# ---------------------------------------------------------------------
+
+#: Money tools re-verified at grant consumption. Only payment.initiate
+#: carries an amount (payment.cancel reverses and has no thresholds).
+REVERIFY_GRANT_TOOLS: frozenset[str] = frozenset({"payment.initiate"})
+
+
+def reverify_money_grant(
+    db: Session,
+    grant: Grant,
+    now: Optional[dt.datetime] = None,
+) -> Optional[str]:
+    """Re-verify a money grant at consumption. Returns a deny reason,
+    or None when the grant may execute."""
+    if grant.tool not in REVERIFY_GRANT_TOOLS:
+        return None
+    now = now or utcnow()
+
+    apr = db.get(ApprovalRequest, grant.approval_request_id)
+    if apr is None:
+        return "grant_approval_missing"
+    redacted = apr.redacted_args or {}
+    amount_cents = redacted.get("amount_cents")
+    payee_key = canonicalize_payee_key(str(redacted.get("payee_key") or ""))
+    if (
+        not isinstance(amount_cents, int)
+        or isinstance(amount_cents, bool)
+        or amount_cents <= 0
+        or not payee_key
+    ):
+        # Cannot establish what the grant authorizes — fail closed.
+        return "grant_args_unverifiable"
+
+    # Current block: the rule may have tightened since approval. The
+    # evidence pins the rule id; a deleted rule fails closed.
+    rule_id = (apr.evidence_subset or {}).get("money_rule_id")
+    rule = db.get(PolicyRule, rule_id) if rule_id is not None else None
+    block = None
+    if (
+        rule is not None
+        and isinstance(rule.conditions, dict)
+        and "money" in rule.conditions
+    ):
+        try:
+            block = validate_money_block(rule.conditions["money"])
+        except ValueError:
+            block = None
+    if block is None:
+        return "money_rule_unverifiable"
+
+    # (fix #3) allowlist state since approval. The fingerprint carries
+    # the payee's record_version at approval time (None when unlisted).
+    fingerprint = apr.context_fingerprint or {}
+    row = AllowlistService(db).lookup(None, payee_key)
+    fingerprinted_version = fingerprint.get("counterparty_record_version")
+    if row is None:
+        if fingerprinted_version is not None:
+            # Listed at approval, removed since → stale context.
+            return "money_context_changed"
+    else:
+        if row.verification_state == STATE_BLOCKED:
+            return "counterparty_blocked"
+        if (
+            fingerprinted_version is not None
+            and row.record_version != fingerprinted_version
+        ):
+            return "money_context_changed"
+
+    # (fix #2) spend caps against the fresh ledger plus other live
+    # reservations (excluding this grant — it is still live and would
+    # otherwise double-count its own amount).
+    state = MoneyStateBuilder(db).build(
+        grant.agent_id,
+        None,
+        payee_key,
+        now,
+        exclude_committed_request_id=grant.approval_request_id,
+    )
+    per_day = block.get("per_day_cents")
+    if (
+        per_day is not None
+        and state.spent_today_cents + state.committed_cents + amount_cents > per_day
+    ):
+        return "spend_cap_exceeded"
+    per_month = block.get("per_month_cents")
+    if (
+        per_month is not None
+        and state.spent_month_cents + state.committed_cents + amount_cents > per_month
+    ):
+        return "spend_cap_exceeded"
+    return None
 
 
 # ---------------------------------------------------------------------
