@@ -41,6 +41,7 @@ ALL_TOOLS = [
     "email.settings.read", "email.settings.write",
     "calendar.list", "calendar.create", "calendar.update", "calendar.delete",
     "code.file.read", "code.pr.open",
+    "codehost.issue_open",
 ]
 
 SENSITIVITY = {
@@ -141,7 +142,7 @@ class TestInventory:
     def test_tool_namespacing(self, registry):
         for name in ALL_TOOLS:
             connector, _, _action = name.partition(".")
-            assert connector in ("email", "calendar", "code")
+            assert connector in ("email", "calendar", "code", "codehost")
             assert name.startswith(connector + ".")
 
 

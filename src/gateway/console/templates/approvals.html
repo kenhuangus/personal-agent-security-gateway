@@ -7,7 +7,7 @@
 <h2>Pending queue</h2>
 {% if queue %}
 <table>
-  <tr><th>Request</th><th>Agent</th><th>Tool</th><th>Requested</th><th>Expires</th><th>Cap</th><th></th></tr>
+  <tr><th>Request</th><th>Agent</th><th>Tool</th><th>Requested</th><th>Expires</th><th>Cap</th><th>Quorum</th><th></th></tr>
   {% for q in queue %}
   <tr>
     <td><code>{{ q.id }}</code>{% if q.destructive %} <span class="badge denied">destructive</span>{% endif %}</td>
@@ -16,6 +16,7 @@
     <td>{{ q.created_at }}</td>
     <td>{{ q.expires_at }}</td>
     <td>{{ q.cap_used }} of {{ q.cap_total }}</td>
+    <td>{% if q.quorum_required and q.quorum_required > 1 %}<span class="badge warn">{{ q.quorum_progress }} of {{ q.quorum_required }}</span>{% else %}<span class="note">single</span>{% endif %}</td>
     <td><button class="warn" onclick="loadCard('{{ q.id }}')">Review</button></td>
   </tr>
   {% endfor %}

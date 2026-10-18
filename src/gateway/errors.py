@@ -30,6 +30,9 @@ ERROR_CODES: tuple[str, ...] = (
     "approval_queue_full",
     "cooldown_active",
     "already_executed",
+    # Pillar 1 §1.2: post-approval re-invoke with altered amount/payee
+    # misses the grant's argument HMAC → tamper-shaped, terminal.
+    "grant_argument_mismatch",
     "agent_paused",
     "agent_canceled",
     "invalid_input",
@@ -61,6 +64,15 @@ SAFE_REASONS: tuple[str, ...] = (
     "agent_paused",
     "agent_canceled",
     "agent_revoked",
+    # Pillar 1 money pack (§1.3): all name the CLASS, never amounts,
+    # payees, or windows.
+    "amount_over_hard_ceiling",
+    "spend_cap_exceeded",
+    "velocity_limit_exceeded",
+    "counterparty_blocked",
+    "mandate_window_closed",
+    "mandate_budget_exhausted",
+    "mandate_checkpoint_overdue",
 )
 
 # Retry guidance per code. approval_required is a poll-then-re-invoke
@@ -73,6 +85,7 @@ _RETRYABLE: dict[str, Any] = {
     "approval_queue_full": "after_request_resolves",
     "cooldown_active": "after_cooldown",
     "already_executed": False,
+    "grant_argument_mismatch": False,
     "agent_paused": False,
     "agent_canceled": False,
     "invalid_input": "fix_args",

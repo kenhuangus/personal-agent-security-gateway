@@ -592,6 +592,14 @@ def validate_rule_dict(rule: dict[str, Any]) -> dict[str, Any]:
     # reject it at save time so the admin gets feedback.
     if r.get("tool") is not None:
         _validate_tool_selector_shape(r["tool"])
+    # Pillar 1: the money block is structurally validated by
+    # money/limits.py (unknown keys rejected — FR-PAA04-002); the
+    # MoneyStage is the evaluation authority, not the OPA input doc.
+    money_block = conditions.get("money")
+    if money_block is not None:
+        from .money.limits import validate_money_block  # local: keep import arrow one-way
+
+        conditions["money"] = validate_money_block(money_block)
     if rule_type == "notice":
         # A notice rule is a standing POLICY RULE (FR-PAA07-005), not a
         # grant: it authorizes matching executions, nothing else.
@@ -1160,8 +1168,14 @@ class PolicyEngine:
             else None
         )
         if rules_data is None:
+            # Pillar 1 §1.4: rules carrying conditions.money are
+            # filtered out of the OPA input document — the Python money
+            # evaluator (MoneyStage) is the single authority, so the
+            # stateless sidecar never double-evaluates thresholds.
             rules_data = [
-                rule_to_input_data(r) for r in self.load_rules(version_number)
+                rule_to_input_data(r)
+                for r in self.load_rules(version_number)
+                if not (r.conditions or {}).get("money")
             ]
             if version_number is not None:
                 _store_rules_data(self.db, version_number, rules_data)
@@ -1671,6 +1685,17 @@ class PolicyStage:
                     ctx.request_id,
                     {"tool": ctx.tool, "unknown_outcome": True, "retry_blocked": True},
                 )
+        # Pillar 1: the MoneyStage (step 3.5) is the single authority
+        # for money calls it decided. Skip rule evaluation for this
+        # call — money rules are filtered from the OPA input document
+        # (§1.4), so evaluating here would double-decide. The unknown-
+        # outcome gate above still runs (retry safety).
+        if getattr(ctx, "policy_short_circuited", False):
+            if getattr(ctx, "needs_approval", False):
+                # The ApprovalStage (step 5) creates the apr_ request;
+                # quorum-aware when the money rule set quorum_required.
+                return None
+            return None
         with timing_span(ctx, "policy"):
             if ctx.agent is None:
                 # Unreachable after AuthenticateStage; fail closed.
@@ -1790,6 +1815,21 @@ SYNTHETIC_CORPUS: list[dict[str, Any]] = [
             "body": "This is a synthetic dry-run call.",
         },
     },
+    # Pillar 1: payment.* synthetic entries — the money ladder
+    # evaluates them as-of "now" against the live ledger (always
+    # empty at cold start, so these exercise the counterparty and
+    # soft-line branches).
+    {
+        "tool": "payment.initiate",
+        "args": {"amount_cents": 25000, "currency": "USD",
+                 "payee_key": "ach:synthetic:xxxx0001"},
+    },
+    {
+        "tool": "payment.initiate",
+        "args": {"amount_cents": 100000000, "currency": "USD",
+                 "payee_key": "ach:synthetic:xxxx0002"},
+    },
+    {"tool": "payment.cancel", "args": {"receipt_id": "pay_synthetic"}},
     {"tool": "email.settings.read", "args": {"section": "forwarding"}},
     {
         "tool": "email.settings.write",
@@ -1882,9 +1922,22 @@ def dry_run(
             mandate = config_db.get(Mandate, row.mandate_id)
             if mandate is not None:
                 purpose = mandate.purpose_key
-        result = engine.evaluate_call(
-            agent, row.tool, row.redacted_args or {}, policy_version, purpose=purpose
-        )
+        # Pillar 1: payment.* rows are evaluated through the money
+        # ladder as-of the row timestamp against the historical money
+        # ledger (redacted args are the acknowledged approximation).
+        if row.tool in ("payment.initiate", "payment.cancel"):
+            from .money.limits import dry_run_decision
+
+            would_be = dry_run_decision(
+                db=config_db, agent=agent, tool=row.tool,
+                args=row.redacted_args or {}, purpose=purpose,
+                policy_version=policy_version, as_of=row.timestamp,
+            )
+            result = _DryRunOutcome(would_be)
+        else:
+            result = engine.evaluate_call(
+                agent, row.tool, row.redacted_args or {}, policy_version, purpose=purpose
+            )
         usable += 1
         counts[f"would_{result.decision}"] += 1
         if result.decision != recorded:
@@ -1909,9 +1962,20 @@ def dry_run(
     # Cold start: synthetic corpus (00 §7 param 17), labeled as such.
     synthetic_agent = _SyntheticAgent()
     for call in SYNTHETIC_CORPUS:
-        result = engine.evaluate_call(
-            synthetic_agent, call["tool"], call["args"], policy_version
-        )
+        if call["tool"] in ("payment.initiate", "payment.cancel"):
+            from .money.limits import dry_run_decision
+
+            would_be = dry_run_decision(
+                db=config_db, agent=synthetic_agent, tool=call["tool"],
+                args=call["args"], purpose=None,
+                policy_version=policy_version,
+                as_of=dt.datetime.now(dt.timezone.utc),
+            )
+            result = _DryRunOutcome(would_be)
+        else:
+            result = engine.evaluate_call(
+                synthetic_agent, call["tool"], call["args"], policy_version
+            )
         counts[f"would_{result.decision}"] += 1
         changed_calls.append(
             {
@@ -1924,6 +1988,14 @@ def dry_run(
             }
         )
     return {"counts": counts, "changed_calls": changed_calls, "corpus": "synthetic"}
+
+
+class _DryRunOutcome:
+    """Ad-hoc dry-run outcome with just the decision string (for the
+    money-ladder path, which does not go through PolicyEngine)."""
+
+    def __init__(self, decision: str) -> None:
+        self.decision = decision
 
 
 class _SyntheticAgent:

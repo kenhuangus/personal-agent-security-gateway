@@ -260,6 +260,151 @@ class Settings:
         default_factory=lambda: bool(_env_int("GATEWAY_JUDGE_ALWAYS_ON", 0))
     )
 
+    # --- Pillar 1: finance-grade gateway (MVP m001/m002; all default-off) ---
+    # Master switch for the money pack (MoneyStage, payment.* tools).
+    # Off = the gateway behaves exactly as before.
+    money_enabled: bool = field(
+        default_factory=lambda: bool(_env_int("GATEWAY_MONEY_ENABLED", 0))
+    )
+    # Event interception mode: "off" | "monitor" | "enforce" (§4, ext).
+    event_interception: str = field(
+        default_factory=lambda: _env("GATEWAY_EVENT_INTERCEPTION", "off")
+    )
+    # Webhook HMAC timestamp acceptance window (seconds, §4.3).
+    webhook_nonce_window_s: int = field(
+        default_factory=lambda: _env_int("GATEWAY_WEBHOOK_NONCE_WINDOW_S", 600)
+    )
+    # Money-ledger retention horizon in days (aligned with audit).
+    money_ledger_retention_days: int = field(
+        default_factory=lambda: _env_int("GATEWAY_MONEY_LEDGER_RETENTION_DAYS", 90)
+    )
+    # Console default for checkpoint_every_days on new mandates (§3).
+    checkpoint_default_days: int = field(
+        default_factory=lambda: _env_int("GATEWAY_CHECKPOINT_DEFAULT_DAYS", 14)
+    )
+    # Staging dir for large compliance exports (§6).
+    compliance_export_dir: str = field(
+        default_factory=lambda: _env("GATEWAY_COMPLIANCE_EXPORT_DIR", "data/exports")
+    )
+    # Force dry_run=True on all payment.initiate calls (demo safety).
+    money_dry_run: bool = field(
+        default_factory=lambda: bool(_env_int("GATEWAY_MONEY_DRY_RUN", 0))
+    )
+
+    # --- Pillar 2: AI security agents (all default-off) ---
+    # Master switch; the agents-runner refuses to start when 0.
+    agents_enabled: bool = field(
+        default_factory=lambda: bool(_env_int("GATEWAY_AGENTS_ENABLED", 0))
+    )
+    agents_runner_poll_s: int = field(
+        default_factory=lambda: _env_int("GATEWAY_AGENTS_RUNNER_POLL_S", 15)
+    )
+    # Sandbox tools (red-team targets): sandbox.echo,
+    # sandbox.payment_initiate, sandbox.event_receive.
+    sandbox_tools: bool = field(
+        default_factory=lambda: bool(_env_int("GATEWAY_SANDBOX_TOOLS", 0))
+    )
+    # Per-agent Fix-A credentials (raw secrets; env/secret-store ONLY —
+    # never written to disk/DB/logs).
+    agent_redteam_credential: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENT_REDATEAM_CREDENTIAL", ""), repr=False
+    )
+    agent_redteam_credential_id: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENT_REDATEAM_CREDENTIAL_ID", "")
+    )
+    agent_sentinel_credential: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENT_SENTINEL_CREDENTIAL", ""), repr=False
+    )
+    agent_sentinel_credential_id: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENT_SENTINEL_CREDENTIAL_ID", "")
+    )
+    agent_policy_assistant_credential: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENT_POLICY_ASSISTANT_CREDENTIAL", ""),
+        repr=False,
+    )
+    agent_policy_assistant_credential_id: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENT_POLICY_ASSISTANT_CREDENTIAL_ID", "")
+    )
+    agent_incident_credential: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENT_INCIDENT_CREDENTIAL", ""), repr=False
+    )
+    agent_incident_credential_id: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENT_INCIDENT_CREDENTIAL_ID", "")
+    )
+    # Red-team schedule + rate limits.
+    redteam_schedule: str = field(
+        default_factory=lambda: _env("GATEWAY_REDATEAM_SCHEDULE", "0 2 * * *")
+    )
+    redteam_tz: str = field(
+        default_factory=lambda: _env("GATEWAY_REDATEAM_TZ", "America/New_York")
+    )
+    redteam_max_attempts_hour: int = field(
+        default_factory=lambda: _env_int("GATEWAY_REDATEAM_MAX_ATTEMPTS_HOUR", 60)
+    )
+    redteam_max_attempts_day: int = field(
+        default_factory=lambda: _env_int("GATEWAY_REDATEAM_MAX_ATTEMPTS_DAY", 500)
+    )
+    redteam_max_concurrency: int = field(
+        default_factory=lambda: _env_int("GATEWAY_REDATEAM_MAX_CONCURRENCY", 2)
+    )
+    redteam_issue_threshold: str = field(
+        default_factory=lambda: _env("GATEWAY_REDATEAM_ISSUE_THRESHOLD", "medium")
+    )
+    redteam_daily_issue_cap: int = field(
+        default_factory=lambda: _env_int("GATEWAY_REDATEAM_DAILY_ISSUE_CAP", 10)
+    )
+    # Issue-store backend: "file" (MVP) | "github" (unimplemented →
+    # fail-closed startup config error).
+    codehost_issues_backend: str = field(
+        default_factory=lambda: _env("GATEWAY_CODEHOST_ISSUES_BACKEND", "file")
+    )
+    codehost_issues_dir: str = field(
+        default_factory=lambda: _env("GATEWAY_CODEHOST_ISSUES_DIR", "data/issues")
+    )
+    codehost_issues_repo: str = field(
+        default_factory=lambda: _env("GATEWAY_CODEHOST_ISSUES_REPO", "")
+    )
+    # Sentinel (extension).
+    sentinel_interval_s: int = field(
+        default_factory=lambda: _env_int("GATEWAY_SENTINEL_INTERVAL_S", 120)
+    )
+    sentinel_probing_n: int = field(
+        default_factory=lambda: _env_int("GATEWAY_SENTINEL_PROBING_N", 10)
+    )
+    sentinel_probing_m_min: int = field(
+        default_factory=lambda: _env_int("GATEWAY_SENTINEL_PROBING_M_MIN", 15)
+    )
+    sentinel_cooldown_h: int = field(
+        default_factory=lambda: _env_int("GATEWAY_SENTINEL_COOLDOWN_H", 1)
+    )
+    sentinel_notify_severity: str = field(
+        default_factory=lambda: _env("GATEWAY_SENTINEL_NOTIFY_SEVERITY", "high")
+    )
+    sentinel_renotify_max: int = field(
+        default_factory=lambda: _env_int("GATEWAY_SENTINEL_RENOTIFY_MAX", 3)
+    )
+    sentinel_renotify_interval_h: int = field(
+        default_factory=lambda: _env_int("GATEWAY_SENTINEL_RENOTIFY_INTERVAL_H", 4)
+    )
+    # Optional OpenAI-compatible LLM for drafting/summaries (never
+    # load-bearing; unset → deterministic-only).
+    agents_llm_url: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENTS_LLM_URL", "")
+    )
+    agents_llm_model: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENTS_LLM_MODEL", "")
+    )
+    agents_llm_api_key: str = field(
+        default_factory=lambda: _env("GATEWAY_AGENTS_LLM_API_KEY", ""), repr=False
+    )
+    # Missed-heartbeat thresholds (counts).
+    agents_heartbeat_missed_amber: int = field(
+        default_factory=lambda: _env_int("GATEWAY_AGENTS_HEARTBEAT_MISSED_AMBER", 2)
+    )
+    agents_heartbeat_missed_red: int = field(
+        default_factory=lambda: _env_int("GATEWAY_AGENTS_HEARTBEAT_MISSED_RED", 5)
+    )
+
     def validate(self) -> list[str]:
         """Return a list of config problems. Empty = OK."""
         problems: list[str] = []
@@ -288,6 +433,31 @@ class Settings:
             problems.append("GATEWAY_JUDGE_TIMEOUT_S must be > 0")
         if self.judge_alert_after_minutes < 0:
             problems.append("GATEWAY_JUDGE_ALERT_AFTER_MINUTES must be >= 0")
+        if self.event_interception not in ("off", "monitor", "enforce"):
+            problems.append(
+                f"GATEWAY_EVENT_INTERCEPTION={self.event_interception!r} is not one of "
+                "off|monitor|enforce"
+            )
+        if self.money_ledger_retention_days <= 0:
+            problems.append("GATEWAY_MONEY_LEDGER_RETENTION_DAYS must be > 0")
+        if self.webhook_nonce_window_s <= 0:
+            problems.append("GATEWAY_WEBHOOK_NONCE_WINDOW_S must be > 0")
+        if self.codehost_issues_backend.strip().lower() not in ("file", "github"):
+            problems.append(
+                f"GATEWAY_CODEHOST_ISSUES_BACKEND={self.codehost_issues_backend!r} "
+                "is not one of file|github"
+            )
+        if self.redteam_issue_threshold.strip().lower() not in (
+            "low", "medium", "high", "critical"
+        ):
+            problems.append(
+                "GATEWAY_REDATEAM_ISSUE_THRESHOLD must be one of "
+                "low|medium|high|critical"
+            )
+        if self.sentinel_notify_severity.strip().lower() not in ("high", "medium"):
+            problems.append(
+                "GATEWAY_SENTINEL_NOTIFY_SEVERITY must be one of high|medium"
+            )
         return problems
 
 

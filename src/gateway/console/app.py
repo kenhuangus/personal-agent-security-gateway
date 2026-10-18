@@ -59,7 +59,9 @@ from .admin_auth import (
 from .approvals import ApprovalConsoleDeps, register_approval_routes
 from .csrf import CsrfProtector
 from .health import HealthMonitor
+from .money import register_money
 from .pages import _admin_audit, register_m6_pages
+from .security_agents import register_security_agents
 from .settings_store import effective_settings
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -649,6 +651,14 @@ def create_console_app(
     register_m6_pages(
         app, config_session_factory, audit_session_factory, settings, csrf,
         health, approval_deps.vault_store, hmac_ring, render_page,
+    )
+
+    # ------------------------------------------------------------------
+    # Pillar 1: Policies → Money page + Pillar 2: Security Agents page
+    # ------------------------------------------------------------------
+    register_money(app, config_session_factory, audit_session_factory, settings, csrf)
+    register_security_agents(
+        app, config_session_factory, audit_session_factory, settings, csrf,
     )
 
     return app

@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Security Agents{% endblock %}
+{% block content %}
+<h1>Security Agents</h1>
+{% if message %}<p class="flash">{{ message }}</p>{% endif %}
+{% if global_stop %}
+<p class="alert"><strong>Global stop is engaged</strong> (since {{ global_stop.at }}, by {{ global_stop.by }}). The agents-runner will not dispatch until you restart each agent individually and then clear this flag. There is no "restart all" — this is deliberate.</p>
+<form method="post" action="/security-agents/global-stop/clear">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit">Clear global stop</button>
+</form>
+{% endif %}
+<p class="note">The security agents authenticate over MCP as ordinary agents and never see vault secrets. They observe, draft, and escalate — they cannot pause agents, block payees, revoke credentials, change policy, or engage global stop. Schedules are created disabled; enable each one explicitly.</p>
+
+{% for a in fleet %}
+<h2>{{ a.display_name }} <span class="note">{{ a.agent_id }}</span></h2>
+{% if not a.exists %}
+<p class="note">Not seeded. Run <code>python -m agents.seed</code> on the console host, then paste each printed credential into its env var on the agents-runner host.</p>
+{% else %}
+<p>{{ a.description }}</p>
+<table>
+  <tr><th>Status</th><th>Schedule</th><th>Next run</th><th>Heartbeat</th><th>Last run</th></tr>
+  <tr>
+    <td><span class="badge {{ a.status }}">{{ a.status }}</span></td>
+    <td>
+      {% if a.schedule %}
+        {% if a.schedule.enabled %}<span class="badge allow">enabled</span>{% else %}<span class="badge deny">disabled</span>{% endif %}
+        {% if a.schedule.cron_expr %}<code>{{ a.schedule.cron_expr }}</code> ({{ a.schedule.timezone }})
+        {% elif a.schedule.interval_seconds %}every {{ a.schedule.interval_seconds }}s{% else %}on-demand{% endif %}
+      {% else %}<span class="note">none</span>{% endif %}
+    </td>
+    <td>{{ a.schedule.next_run_at if a.schedule and a.schedule.next_run_at else "—" }}</td>
+    <td>
+      {% if a.heartbeat %}
+        <span class="badge {{ a.heartbeat.health }}">{{ a.heartbeat.health }}</span>
+        {{ a.heartbeat.status }} · {{ a.heartbeat.ts }}
+        {% if a.heartbeat.note %}<br><span class="note">{{ a.heartbeat.note }}</span>{% endif %}
+      {% else %}<span class="note">no heartbeat yet</span>{% endif %}
+    </td>
+    <td>
+      {% if a.last_run %}
+        <span class="badge {{ a.last_run.status }}">{{ a.last_run.status }}</span>
+        {{ a.last_run.trigger }} · {{ a.last_run.started_at or "—" }}
+        {% if a.last_run.run_log and a.last_run.run_log.note %}<br><span class="note">{{ a.last_run.run_log.note }}</span>{% endif %}
+      {% else %}<span class="note">never ran</span>{% endif %}
+    </td>
+  </tr>
+</table>
+<div class="filters">
+  <form method="post" action="/security-agents/run-now" style="display:inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="agent_id" value="{{ a.agent_id }}">
+    <button type="submit">Run now</button>
+  </form>
+  <form method="post" action="/security-agents/restart" style="display:inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="agent_id" value="{{ a.agent_id }}">
+    <button type="submit">Restart</button>
+  </form>
+  {% if a.schedule %}
+  <form method="post" action="/security-agents/schedule" style="display:inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="agent_id" value="{{ a.agent_id }}">
+    <label>Enabled <input type="checkbox" name="enabled" value="true"{% if a.schedule.enabled %} checked{% endif %}></label>
+    <label>Cron <input name="cron_expr" size="12" placeholder="{{ a.schedule.cron_expr or '0 2 * * *' }}"></label>
+    <button type="submit">Save schedule</button>
+  </form>
+  {% endif %}
+</div>
+{% if a.recent_runs %}
+<h3>Recent runs</h3>
+<table>
+  <tr><th>Run</th><th>Trigger</th><th>Status</th><th>Started</th><th>Finished</th></tr>
+  {% for r in a.recent_runs %}
+  <tr><td><code>{{ r.id }}</code></td><td>{{ r.trigger }}</td><td><span class="badge {{ r.status }}">{{ r.status }}</span></td><td>{{ r.started_at or "—" }}</td><td>{{ r.finished_at or "—" }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endblock %}

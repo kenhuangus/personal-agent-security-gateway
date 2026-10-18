@@ -195,6 +195,21 @@ class CallContext:
     # (judge_signals_for_approval_record()); deterministic flags and
     # the escalator are unchanged.
     judge_counterparty_signals: Optional[dict[str, Any]] = None
+    # -- Pillar 1: money pack (step 3.5, MoneyStage) ----------------------
+    # Set when the money stage decided the call: the normal policy
+    # stage must not re-evaluate it (the Python money evaluator is the
+    # single authority — no Rego/Python dual maintenance).
+    policy_short_circuited: bool = False
+    # Approvers needed for this call (1 = single-approver path); set
+    # by the money stage from the rule's quorum block.
+    quorum_required: int = 1
+    # The matched money rule id + threshold ladder outputs for the
+    # approval card (remaining budget from evidence, never the reason).
+    money_rule_id: Optional[int] = None
+    money_state: Optional[Any] = None
+    money_card: Optional[dict[str, Any]] = None
+    money_new_counterparty: bool = False
+    money_block: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -922,6 +937,7 @@ def _decision_for_error(error: GatewayError) -> str:
         "approval_queue_full": "denied",
         "cooldown_active": "denied",
         "already_executed": "denied",
+        "grant_argument_mismatch": "denied",
         "agent_paused": "denied",
         "agent_canceled": "denied",
         "invalid_input": "denied",
@@ -1071,6 +1087,11 @@ def build_pipeline(
     approvals: bool = False,
     minter: Optional["TokenMinter"] = None,
     judge_cascade: Optional[Any] = None,
+    # Pillar 1: the MoneyStage (step 3.5). Build with
+    # money.build_money_stage(config_db, settings); None = the money
+    # pack is off and payment.* falls through to the normal policy
+    # stage (the spending_thresholds preset is the backstop).
+    money_stage: Optional[Any] = None,
 ) -> tuple[Pipeline, ConnectorRegistry, AuthenticateStage]:
     """Assemble the M2/M3 pipeline: hardened validator + REAL policy engine.
 
@@ -1156,6 +1177,11 @@ def build_pipeline(
             counterparty_hook=counterparty_hook,
         ),
         MandateStage(mandates),
+        # Pillar 1 §1.5: the money check is a policy specialization
+        # that needs mandate liveness first (step 3.5). Additive: with
+        # the money pack off the stage is None and the order is the
+        # existing Fix-B order.
+        *([money_stage] if money_stage is not None else []),
         RealPolicyStage(
             config_db, grant_checker=grant_checker, hmac_ring=hmac_ring,
             defer_approval=defer_approval,
